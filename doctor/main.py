@@ -13,7 +13,7 @@ from .config import get_settings
 from .db import Session, init_db, Incident, Occurrence, Diagnosis, FixJob, Deployment, AgentRun, State, serialize, now
 from .bus import bus
 from .runner_client import runner_call
-from .monitoring import ingest_batch, retention, flush_pending
+from .monitoring import ingest_batch, retention, flush_pending, release_cooldowns
 from .security import redact
 
 
@@ -65,6 +65,7 @@ async def retention_worker():
 async def parser_worker():
     while True:
         updates = flush_pending()
+        updates['changed'].extend(release_cooldowns())
         if updates['changed']:
             await bus.publish('incidents', updates)
         await asyncio.sleep(0.5)

@@ -49,7 +49,7 @@ Collector выбирает контейнеры **только по двум Doc
 
 ERROR/FATAL и необработанные Java exceptions собираются вместе со stack trace, `Caused by`, logger, application frames, файлом/строкой и версией image. INFO/DEBUG/TRACE не вызывают AI. Слово `retry` **не исключает ERROR**. WARN connection failures, exhausted pool, deadlocks, retry exhaustion, timeout и health/external failures проходят только после порога **3 события за 60 секунд**; пороги меняются в Settings.
 
-Fingerprint использует service/version, тип исключения, нормализованные message/root cause и значимые application frames. UUID, timestamps и динамические числа нормализуются. Повторы увеличивают `occurrences`, но не вызывают новую диагностику. Новый контекст/версия может создать новый incident. Повтор resolved fingerprint переоткрывает incident. Есть ручной Re-analyze.
+Fingerprint использует service/version, тип исключения, нормализованные message/root cause и значимые application frames. UUID, timestamps и динамические числа нормализуются. Повторы увеличивают `occurrences`, но не вызывают новую диагностику. Новый контекст/версия может создать новый incident. Повтор resolved fingerprint переоткрывает incident; недавний диагноз защищён persistent cooldown (по умолчанию 900 секунд), после которого ставится одна повторная диагностика. Ручной Re-analyze может явно обойти cooldown.
 
 Сырые логи бесконечно не хранятся: trace ≤32 KiB, контекст — несколько строк, occurrence retention по умолчанию 30 дней, receipts — 3 дня. Суммарные occurrences и история diagnoses/fixes/deployments сохраняются. SSE служит уведомлением; при открытии UI всё загружается из SQLite.
 
@@ -57,7 +57,7 @@ Fingerprint использует service/version, тип исключения, �
 
 Автоматическая диагностика — обычно **один** реальный DeepSeek-вызов Flash. Контекст ищется по stack frame, точному filename/class/line и ограниченным фрагментам, а не по всему репозиторию. API сохраняет наблюдения отдельно от гипотез, рекомендации, confidence, реальные usage и latency. Если провайдер не вернул usage, числа помечаются approximate.
 
-Flash и Pro обнаруживаются через API, модель выбирается явно в UI. По умолчанию один одновременный LLM-вызов, ограниченные context/output, ограниченная очередь диагностики. Ошибка API сохраняется как ошибка — никакого mock fallback. Fix Agent ограничен `MAX_AGENT_ITERATIONS` (по умолчанию 5), количеством tools и размером результатов. Исчерпание бюджета останавливает job и сохраняет промежуточный diff; нет обхода лимита новым циклом.
+Flash и Pro обнаруживаются через API, модель выбирается явно в UI. По умолчанию один одновременный LLM-вызов, ограниченные context/output, ограниченная очередь диагностики. Ошибка API сохраняется как ошибка — никакого mock fallback. Fix Agent ограничен `MAX_AGENT_ITERATIONS` (по умолчанию 5), количеством tools и размером результатов. Исследование занимает максимум два вызова; затем отдельный non-tool JSON-вызов генерирует реальные replacements/new Java files, которые проверяет runner. Это не заранее записанный patch. Исчерпание бюджета останавливает job и сохраняет промежуточный diff. **Continue remaining budget** — только явное действие, только для последней job и без сброса уже потраченных вызовов. Исторические superseded jobs продолжать нельзя.
 
 ## Fix и deploy
 
@@ -70,6 +70,8 @@ Flash и Pro обнаруживаются через API, модель выби�
 7. При неудаче возвращает прежний image и проверяет его здоровье. MySQL/volumes не удаляются, обратные SQL-миграции не выполняются. Изменения build policy/миграций не допускаются через fix tools.
 
 Подробнее о реальной демонстрации и её границах: [docs/demo.md](docs/demo.md). Результаты конкретного запуска: [summary.md](summary.md).
+
+Если host runner аварийно остановился во время переключения image, сначала проверьте его durable journal (раздел deployment в `/status`). Не запускайте новый deploy вслепую. Явное операторское восстановление прежнего release: `.venv/bin/python -c "from doctor.runner import recover_deployment; print(recover_deployment(confirmed=True)['status'])"`. Это не LLM tool и не HTTP endpoint. После обновления Python-кода host-процессов используйте `.venv/bin/python scripts/restart-host.py` только когда нет активного deploy/test job.
 
 ## Граница доверия
 

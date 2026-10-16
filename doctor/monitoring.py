@@ -5,7 +5,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from sqlalchemy import select, delete
 from .config import get_settings
-from .db import Base, Session, State, Incident, Occurrence, now
+from .db import Base, Session, State, Incident, Occurrence, Diagnosis, now
 from sqlalchemy.orm import Mapped, mapped_column
 from .security import redact
 
@@ -146,7 +146,13 @@ def store_event(session, event: dict) -> tuple[int | None, bool]:
         incident.event = event
         if incident.status == 'RESOLVED':
             incident.status = 'NEW'
-            incident.diagnosis_status = 'PENDING'
+            latest = session.scalar(select(Diagnosis.created_at).where(Diagnosis.incident_id == incident.id).order_by(Diagnosis.id.desc()).limit(1))
+            due = (datetime.fromisoformat(latest).timestamp() + get_settings().diagnosis_cooldown_seconds) if latest else 0
+            if due > time.time():
+                incident.diagnosis_status = 'COOLDOWN'
+                session.merge(State(key=f'cooldown:{incident.id}', value={'until': due}))
+            else:
+                incident.diagnosis_status = 'PENDING'
             created = True
     session.add(Occurrence(incident_id=incident.id, source_id=event['source_id']))
     return incident.id, created
@@ -212,6 +218,20 @@ def flush_pending() -> dict:
                 if new:
                     created.append(incident_id)
     return {'changed': changed, 'new_incidents': created}
+
+
+def release_cooldowns() -> list[int]:
+    changed = []
+    with Session.begin() as session:
+        for state in session.scalars(select(State).where(State.key.like('cooldown:%'))):
+            incident = session.get(Incident, int(state.key.split(':')[1]))
+            if not incident or incident.diagnosis_status != 'COOLDOWN':
+                session.delete(state)
+            elif state.value.get('until', 0) <= time.time():
+                incident.diagnosis_status = 'PENDING'
+                session.delete(state)
+                changed.append(incident.id)
+    return changed
 
 
 def retention():

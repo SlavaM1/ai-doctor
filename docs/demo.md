@@ -2,6 +2,10 @@
 
 Сначала запустите `bash scripts/start.sh` из `ai-doctor`. Откройте http://127.0.0.1:3050. Для реальной диагностики нужен действующий `DEEPSEEK_API_KEY`.
 
+**Итоговый стенд уже исправлен.** В SQLite сохранены incident #2, Fix #3 и успешный Deployment #1. Для проверки текущего результата выполните `python3 scripts/smoke_doctor_demo.py --expect-repaired` из target worktree. Старый trigger теперь тоже возвращает 200 — это ожидаемый результат, а не поломка monitoring.
+
+Чтобы воспроизвести весь сценарий с нуля на отдельном чистом стенде, создайте target worktree сразу на pre-fix commit **`7798c12d3741525990c63549ca7d97fdac9be72b`**, до первого запуска AI Doctor. Не переключайте существующий пользовательский checkout и не сбрасывайте текущий deployment. Например, при отсутствии `../aurelSpa-day35`: `git -C ../aurelSpa worktree add ../aurelSpa-day35 7798c12d3741525990c63549ca7d97fdac9be72b`. Настройте приватные `.env` по README. Если такой каталог/стенд уже существует, используйте отдельную среду, порты и volumes, а не перезаписывайте его.
+
 ## A. Docker ERROR → incident → DeepSeek
 
 В отдельном integration worktree:
@@ -33,6 +37,6 @@ python3 scripts/smoke_doctor_demo.py --trigger
 
 ## E. Rollback
 
-Unit/integration suite проверяет отказ новой версии и возврат предыдущего image. Результат отдельной реальной безопасной rollback-проверки, если выполнена, указан в `summary.md`. Не ломайте БД/production профиль ради демонстрации. Не удаляйте volumes; миграции не откатываются SQL-командами.
+Реальная безопасная rollback-проверка выполнена: `ROLLED_BACK`, восстановлен точный прежний image и HTTP 200. Для повторения из `ai-doctor`: `.venv/bin/python scripts/check_rollback.py`. Скрипт использует отдельный project `day35-doctor-rollback`, порт 8086 и отдельные MySQL/uploads volumes; запускает реальный aurelSpa, намеренно строит неработающий candidate image и вызывает настоящие production runner activation/health/rollback. Только построение fault image является тестовой инъекцией; Docker operations не mocked. Тест не является одобрением другого Fix diff. После проверки останавливаются только его контейнеры без удаления volumes. Не запускайте одновременно два экземпляра этого теста.
 
 После успешного fix исходный дефект больше не воспроизводится. Для повторения A–D нужен новый изолированный demo release из начального SHA ветки, с отдельным approval; не откатывайте пользовательский checkout или БД.

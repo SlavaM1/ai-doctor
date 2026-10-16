@@ -4,7 +4,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 from doctor import monitoring as m
-from doctor.db import Base, Incident, Occurrence, State
+from doctor.db import Base, Incident, Occurrence, State, Diagnosis
 
 
 @pytest.fixture
@@ -122,6 +122,21 @@ def test_idle_buffer_finalizes_without_container_poll(store):
         session.add(State(key='parser:removed', value=parser.state))
     assert len(m.flush_pending()['new_incidents']) == 1
     assert m.flush_pending()['new_incidents'] == []
+
+
+def test_reopened_incident_observes_persistent_diagnosis_cooldown(store):
+    with store.begin() as session:
+        incident_id, _ = m.store_event(session, java_event(source='initial'))
+        session.add(Diagnosis(incident_id=incident_id))
+        session.get(Incident, incident_id).status = 'RESOLVED'
+    with store.begin() as session:
+        m.store_event(session, java_event(source='reopened'))
+        assert session.get(Incident, incident_id).diagnosis_status == 'COOLDOWN'
+    assert m.release_cooldowns() == []
+    with store.begin() as session:
+        session.get(State, f'cooldown:{incident_id}').value = {'until': 0}
+    assert m.release_cooldowns() == [incident_id]
+    assert m.release_cooldowns() == []
 
 
 def test_trace_is_size_bounded():

@@ -20,16 +20,25 @@ def main():
     active = json.loads((state / 'active.json').read_text()) if (state / 'active.json').exists() else None
     env = {**os.environ, 'SOURCE_REVISION': revision}
     if active:
+        service = cfg.allowed_services.split(',')[0]
+        ids = subprocess.check_output(['docker', 'ps', '-q', '--filter', f'label=com.docker.compose.project={cfg.compose_project}',
+                                       '--filter', f'label=com.docker.compose.service={service}'], text=True).split()
+        if len(ids) > 1:
+            raise SystemExit('Ambiguous running target; no release is replaced automatically.')
+        if ids:
+            running = subprocess.check_output(['docker', 'inspect', '--format', '{{.Image}}', ids[0]], text=True).strip()
+            if running != active['image']:
+                raise SystemExit('Running image differs from the approved journal; inspect the external change before starting.')
         subprocess.run(['docker', 'image', 'inspect', active['image']], stdout=subprocess.DEVNULL, check=True)
         override = Path('.runtime/current-release.json')
         override.write_text(json.dumps({'services': {cfg.allowed_services.split(',')[0]: {'image': active['image']}}}))
-        subprocess.run(['docker', 'compose', '-f', 'compose.yaml', '-f', str(override), 'up', '-d', '--no-build', 'mysql', cfg.allowed_services.split(',')[0]], env=env, check=True)
-        subprocess.run(['docker', 'compose', 'up', '-d', '--build', 'api', 'frontend'], env=env, check=True)
+        subprocess.run(['docker', 'compose', '-f', 'compose.yaml', '-f', str(override), 'up', '-d', '--wait', '--wait-timeout', '180', '--no-build', 'mysql', cfg.allowed_services.split(',')[0]], env=env, check=True)
+        subprocess.run(['docker', 'compose', 'up', '-d', '--wait', '--wait-timeout', '180', '--build', 'api', 'frontend'], env=env, check=True)
     else:
         dirty = subprocess.check_output(['git', '-C', str(source), 'status', '--porcelain'], text=True)
         if dirty:
             raise SystemExit('Integration source is dirty: commit/review it before building a provenance-labelled baseline.')
-        subprocess.run(['docker', 'compose', 'up', '-d', '--build'], env=env, check=True)
+        subprocess.run(['docker', 'compose', 'up', '-d', '--wait', '--wait-timeout', '180', '--build'], env=env, check=True)
 
 
 if __name__ == '__main__':
