@@ -1,0 +1,37 @@
+name: day35-aurelspa
+include:
+  - path: ${TARGET_COMPOSE_FILE:-../aurelSpa-day35/compose.yaml}
+services:
+  api:
+    build: .
+    env_file: .env
+    environment:
+      DATABASE_URL: sqlite:////data/doctor.db
+      RUNNER_SOCKET: /run/doctor/runner.sock
+    ports: ['127.0.0.1:8050:8000']
+    volumes:
+      - doctor-data:/data
+      - ./.runtime/socket:/run/doctor:ro
+    networks: [doctor]
+    restart: unless-stopped
+    read_only: true
+    tmpfs: ['/tmp:size=16m']
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 384m
+  frontend:
+    build: ./frontend
+    ports: ['127.0.0.1:3050:80']
+    depends_on:
+      api:
+        condition: service_healthy
+    networks: [doctor]
+    restart: unless-stopped
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETUID, SETGID, NET_BIND_SERVICE]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 128m
+networks:
+  doctor: {}
+volumes:
+  doctor-data: {}
