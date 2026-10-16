@@ -558,6 +558,8 @@ class Runner:
             previous = self.ops.current()
             if active and previous['image'] != active['image']:
                 fail('Running image changed outside the deployment journal', 409)
+            if not active and previous.get('patch_sha'):
+                fail('Patched image has no trusted active journal; restore its journal or use a clean provenance-labelled baseline', 409)
             if not active and previous.get('source_revision') != meta['base_commit']:
                 fail('Running image source revision does not match the approved base; rebuild a provenance-labelled baseline first', 409)
             if meta.get('base_image') and previous['image'] != meta['base_image']:

@@ -34,7 +34,7 @@ from doctor.security import redact_data
 
 
 PROJECT = 'day35-doctor-rollback'
-SOURCE = Path('/home/slava/ai/aurelSpa-day35')
+SOURCE = Path(get_settings().source_repo)
 BASE_URL = 'http://127.0.0.1:8086'
 IMAGE_ID = re.compile(r'sha256:[a-f0-9]{64}')
 
@@ -167,12 +167,23 @@ def isolated_proof(args, directory, runtime):
         # later live deployments cannot retarget this isolated baseline.
         baseline = args.baseline_image or command([
             'docker', 'inspect', '--format', '{{.Image}}', 'day35-aurelspa-spring-1'])
+        labels = json.loads(command(['docker', 'image', 'inspect', '--format', '{{json .Config.Labels}}', baseline])) or {}
+        if labels.get('doctor.patch') and not args.baseline_image:
+            journal = Path(get_settings().workspace_root) / '.runner-state/deployment.json'
+            recorded = json.loads(journal.read_text()) if journal.exists() else {}
+            require(recorded.get('status') == 'SUCCEEDED' and recorded.get('image') == baseline,
+                    'Patched running image requires its verified deployment journal')
+            baseline = recorded['previous_image']
+            labels = json.loads(command(['docker', 'image', 'inspect', '--format', '{{json .Config.Labels}}', baseline])) or {}
+        require(not labels.get('doctor.patch'), 'Select an unpatched provenance-labelled baseline image for this isolated proof')
         require(IMAGE_ID.fullmatch(baseline), 'Baseline must be an immutable Docker image id')
         require(command(['docker', 'image', 'inspect', '--format', '{{.Id}}', baseline]) == baseline,
                 'Baseline image is not available locally')
         evidence['images']['baseline'] = baseline
-        revision = command(['git', '-C', str(SOURCE), 'rev-parse', '--verify', 'HEAD'])
-        require(re.fullmatch('[a-f0-9]{40,64}', revision), 'Invalid integration HEAD')
+        revision = labels.get('org.opencontainers.image.revision', '')
+        require(re.fullmatch('[a-f0-9]{40,64}', revision), 'Baseline has no immutable source provenance')
+        require(command(['git', '-C', str(SOURCE), 'rev-parse', '--verify', revision + '^{commit}']) == revision,
+                'Exact baseline source commit is unavailable')
         evidence['base_commit'] = revision
         baseline_revision = command(['docker', 'image', 'inspect', '--format',
                                      '{{index .Config.Labels "org.opencontainers.image.revision"}}', baseline])
@@ -187,7 +198,10 @@ def isolated_proof(args, directory, runtime):
         raw = raw.replace('name: day35-aurelspa\n', f'name: {PROJECT}\n', 1)
         raw = raw.replace('127.0.0.1:8085:8080', '127.0.0.1:8086:8080', 1)
         refresh_runtime_copy(compose, raw.encode(), run_dir / 'previous-config')
-        refresh_runtime_copy(directory / '.env', (SOURCE / '.env').read_bytes(), run_dir / 'previous-config')
+        private_env = (SOURCE / '.env').read_text()
+        private_env = re.sub(r'^SOURCE_REVISION=.*\n?', '', private_env, flags=re.M).rstrip() + '\nSOURCE_REVISION=' + revision + '\n'
+        refresh_runtime_copy(directory / '.env', private_env.encode(), run_dir / 'previous-config')
+        os.environ['SOURCE_REVISION'] = revision  # This test process only; never changes target .env.
         env = dotenv_values(directory / '.env')
         for key in ('MYSQL_PASSWORD', 'MYSQL_ROOT_PASSWORD', 'DOCTOR_DEMO_TOKEN', 'SOURCE_REVISION'):
             require(bool(env.get(key)), 'Required isolated environment value is missing')

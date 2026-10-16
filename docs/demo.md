@@ -39,4 +39,6 @@ python3 scripts/smoke_doctor_demo.py --trigger
 
 Реальная безопасная rollback-проверка выполнена: `ROLLED_BACK`, восстановлен точный прежний image и HTTP 200. Для повторения из `ai-doctor`: `.venv/bin/python scripts/check_rollback.py`. Скрипт использует отдельный project `day35-doctor-rollback`, порт 8086 и отдельные MySQL/uploads volumes; запускает реальный aurelSpa, намеренно строит неработающий candidate image и вызывает настоящие production runner activation/health/rollback. Только построение fault image является тестовой инъекцией; Docker operations не mocked. Тест не является одобрением другого Fix diff. После проверки останавливаются только его контейнеры без удаления volumes. Не запускайте одновременно два экземпляра этого теста.
 
+После успешного AI release тест выбирает прежний clean image из проверенного journal и создаёт source worktree **на его OCI revision**, а не на произвольном новом HEAD. Можно явно задать `--baseline-image sha256:…`; image с AI patch без своего journal не принимается за clean baseline. Исходный checkout и его `.env` при этом не меняются.
+
 После успешного fix исходный дефект больше не воспроизводится. Для повторения A–D нужен новый изолированный demo release из начального SHA ветки, с отдельным approval; не откатывайте пользовательский checkout или БД.

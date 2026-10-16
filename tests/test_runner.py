@@ -33,7 +33,7 @@ class FakeDeployment:
         self.builds = []
 
     def current(self):
-        return {'image': self.image, 'source_revision': self.revision}
+        return {'image': self.image, 'source_revision': self.revision, 'patch_sha': getattr(self, 'patch_sha', '')}
 
     def build(self, context, patch_sha):
         self.builds.append((context / 'Dockerfile').read_text())
@@ -263,6 +263,15 @@ def test_first_deploy_rejects_unlabelled_or_mismatched_running_baseline(harness)
     request = approved(h)
     h.ops.revision = 'a' * 40
     with pytest.raises(HTTPException, match='source revision'):
+        h.runner.deploy(request)
+    assert not h.ops.activated
+
+
+def test_patched_baseline_without_its_journal_cannot_hide_undisplayed_changes(harness):
+    h = harness
+    request = approved(h)
+    h.ops.patch_sha = 'a' * 64
+    with pytest.raises(HTTPException, match='no trusted active journal'):
         h.runner.deploy(request)
     assert not h.ops.activated
 
