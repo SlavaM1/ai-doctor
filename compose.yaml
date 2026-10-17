@@ -1,6 +1,8 @@
 name: day35-aurelspa
 include:
-  - path: ${TARGET_COMPOSE_FILE:-../aurelSpa-day35/compose.yaml}
+  - path:
+      - ${TARGET_COMPOSE_FILE:-../aurelSpa-day35/compose.yaml}
+      - ./compose.mail.yaml
 services:
   api:
     build: .

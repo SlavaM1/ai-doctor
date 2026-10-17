@@ -2,6 +2,11 @@ from functools import lru_cache
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+MAX_AGENT_ITERATIONS = 200
+MAX_CONTEXT_TOKENS = 128000
+MAX_OUTPUT_TOKENS = 16000
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file='.env', extra='ignore')
     database_url: str = 'sqlite:///.runtime/doctor.db'
@@ -27,6 +32,7 @@ class Settings(BaseSettings):
     source_repo: str = '/home/slava/ai/aurelSpa-day35'
     workspace_root: str = '/home/slava/ai/ai-doctor-workspaces'
     target_compose_file: str = '/home/slava/ai/aurelSpa-day35/compose.yaml'
+    deployment_compose_file: str = ''
     target_health_url: str = 'http://127.0.0.1:8085/health'
     target_smoke_url: str = 'http://127.0.0.1:8085/'
     deployment_health_timeout_seconds: int = 120

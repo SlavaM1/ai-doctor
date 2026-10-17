@@ -344,6 +344,8 @@ class Runner:
             existing = self.load(workspace_id + '.json')
             if existing:
                 path, existing = self.workspace_meta(workspace_id)
+                if existing['base_commit'] != self.head():
+                    fail('Stale workspace base commit', 409)
                 self.inherit_active_release(path, existing)
                 return {'workspace_id': workspace_id, 'base_commit': existing['base_commit'],
                         'inherited_patch_sha': existing.get('parent_patch_sha', '')}
@@ -876,11 +878,14 @@ class DockerDeployment:
     def activate(self, image):
         if not re.fullmatch('sha256:[a-f0-9]{64}', image):
             raise RuntimeError('Only immutable image ids may be deployed')
+        # Use the same infrastructure overrides as startup (e.g. local SMTP),
+        # while still replacing only the allowlisted application service.
+        compose_file = getattr(self.settings, 'deployment_compose_file', '') or self.settings.target_compose_file
         with tempfile.NamedTemporaryFile(mode='w', suffix='.json', dir=self.runner.state) as override:
             json.dump({'services': {self.service: {'image': image}}}, override)
             override.flush()
             self.command(['docker', 'compose', '--project-name', self.project,
-                          '--file', str(Path(self.settings.target_compose_file).resolve()),
+                          '--file', str(Path(compose_file).resolve()),
                           '--file', override.name, 'up', '-d', '--no-deps', '--no-build',
                           '--pull', 'never', self.service], timeout=180)
 

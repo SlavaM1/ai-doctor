@@ -536,6 +536,29 @@ def test_compose_command_has_fixed_project_service_and_no_build(harness):
         ops.activate('app:latest; rm -rf /')
 
 
+def test_stale_existing_workspace_is_rejected_before_any_model_or_test_work(harness):
+    h = harness
+    ws = workspace(h)
+    original = h.runner.load(ws + '.json')
+    git(h.repo, 'commit', '--allow-empty', '-qm', 'New verified baseline')
+    with pytest.raises(HTTPException, match='Stale workspace base commit'):
+        workspace(h)
+    assert h.runner.load(ws + '.json') == original
+    assert not h.commands
+
+
+def test_deploy_and_rollback_use_configured_stack_without_restarting_dependencies(harness):
+    h = harness
+    h.settings.deployment_compose_file = str(h.repo.parent / 'doctor-compose.yaml')
+    ops = DockerDeployment(h.runner)
+    for image in [h.ops.new, h.ops.old]:
+        ops.activate(image)
+        argv = h.commands[-1]
+        assert argv[5] == str(Path(h.settings.deployment_compose_file).resolve())
+        assert str(Path(h.settings.target_compose_file).resolve()) not in argv
+        assert argv[-7:] == ['up', '-d', '--no-deps', '--no-build', '--pull', 'never', 'app']
+
+
 def test_deployed_fingerprint_matches_even_when_image_version_changes(harness):
     from doctor.monitoring import fingerprint, parse_event
     logs = 'java.lang.IllegalStateException: incorrect value\n\tat example.Example.value(Example.java:3)\n'
@@ -1211,3 +1234,53 @@ def test_context_keeps_latest_requested_source_and_pinned_compiler_failure():
     assert 'UNIQUE_REQUESTED_SOURCE' in text and 'UNIQUE_COMPILER_FAILURE' in text
     assert any(message.get('tool_call_id') == 'read' for message in fitted)
     assert any(message.get('tool_calls') for message in fitted)
+
+
+def test_larger_context_preserves_more_than_three_source_turns():
+    from doctor.fixing import SYSTEM, TOOLS, _fit_messages
+    settings = SimpleNamespace(max_context_tokens=128000, max_output_tokens=16000)
+    initial = [{'role': 'system', 'content': SYSTEM},
+               {'role': 'user', 'content': json.dumps({'goal': 'Complete the fix and its tests'})}]
+    turns = []
+    for index in range(8):
+        turns.append([{'role': 'assistant', 'tool_calls': [{'id': f'read-{index}', 'type': 'function',
+                       'function': {'name': 'file_read', 'arguments': json.dumps({'path': f'src/File{index}.java'})}}]},
+                      {'role': 'tool', 'tool_call_id': f'read-{index}', 'content': f'UNIQUE_FILE_{index} ' + 'source\n' * 100}])
+    fitted = _fit_messages(initial, turns, TOOLS, settings)
+    text = json.dumps(fitted)
+    assert all(f'UNIQUE_FILE_{index}' in text for index in range(8))
+    assert len([message for message in fitted if message.get('role') == 'tool']) == 8
+
+
+@pytest.mark.asyncio
+async def test_stagnant_partial_patch_switches_to_editing_instead_of_repeated_reads(fixing_harness, monkeypatch):
+    h = fixing_harness
+    h.settings.max_agent_iterations = 12
+    h.settings.max_context_tokens = 128000
+    h.settings.max_output_tokens = 16000
+    calls = 0
+
+    async def llm(*args, tools=None, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            h.runner.test_result.update(returncode=1, output='[ERROR] incomplete patch')
+            return tool_response('file_apply_patch', {'path': JAVA, 'replacements': [{'old': '"bad"', 'new': '"broken"'}]})
+        if tools is not None:
+            return tool_response('file_read', {'path': JAVA})
+        assert args[3] == 'fix_patch'
+        payload = json.loads(args[0][1]['content'])
+        assert payload['current_tests']['passed'] is False
+        assert JAVA in payload['existing_files']
+        # Unchanged repeated reads don't erase other evidence or crowd the prompt.
+        assert len([item for item in payload['research'] if item.get('path') == JAVA]) == 1
+        h.runner.test_result.update(returncode=0, output='Tests passed')
+        return {'choices': [{'message': {'content': json.dumps({'summary': 'Оставшаяся правка готова',
+                    'changes': [{'path': JAVA, 'old': '"broken"', 'new': '"complete"'}], 'new_files': []})}}]}
+
+    monkeypatch.setattr(h.fixing, 'llm_call', llm)
+    result = await h.fixing.prepare_fix(h.job_id)
+    assert result['status'] == 'READY' and calls == 8
+    assert 'complete' in result['patch'] and result['tests']['passed']
+    assert any(event['kind'] == 'progress' and event['data']['stagnant_turns'] == 6 for event in result['events'])
+    assert not h.runner.ops.activated

@@ -3,6 +3,14 @@ import type { Status } from './types'
 
 export const exclusionStatuses = ['EXCLUDED', 'NO_ACTION']
 
+export function ExcludedNotice({ stats, onOpen }: { stats?: Status['stats']; onOpen: () => void }) {
+  if (!stats?.excluded_incidents) return null
+  return <div className="model-warning" role="status">
+    <p>Ошибки в исключениях: {number(stats.excluded_incidents)}. Они собираются и учитываются в счётчиках, но исключённые типы скрыты из основной очереди. За последний час: {number(stats.excluded_errors_hour)} повторений.</p>
+    <button className="button" onClick={onOpen}>Показать исключённые ошибки</button>
+  </div>
+}
+
 export default function ExclusionSummary({ stats }: { stats?: Status['stats'] }) {
   return <section className="telemetry" aria-label="Статистика исключений">
     <div className="metric"><span>Инцидентов в исключениях</span><strong>{number(stats?.excluded_incidents)}</strong><small>Включая «Не требует решения»</small></div>

@@ -7,14 +7,16 @@ from sqlalchemy import select, update
 
 from .ai import INCIDENT_POLICY, llm_call, select_model
 from .bus import bus
-from .config import get_settings
+from .config import get_settings, MAX_AGENT_ITERATIONS
 from .db import AgentRun, Deployment, Diagnosis, FixJob, Incident, Session, State, now, serialize
 from .runner_client import runner_call
 from .security import redact, redact_data
 
 
-MAX_TOOL_CALLS = 60
-MAX_ITERATIONS = 30
+MAX_TOOL_CALLS = 1000
+MAX_ITERATIONS = MAX_AGENT_ITERATIONS
+MAX_PREPARATION_SECONDS = 7200
+STAGNANT_TURNS_BEFORE_PATCH = 6
 BLOCKING_DEPLOYMENTS = ('QUEUED', 'RUNNING', 'DEPLOYING', 'UNKNOWN', 'INTERRUPTED', 'ROLLBACK_FAILED')
 NEW_WORKSPACE_ERRORS = ('Workspace parent release changed; prepare a new fix',
                         'Retained edits conflict with active release; prepare a new fix',
@@ -38,6 +40,7 @@ templates/styles before designing an error page; preserve the project's style.
 An inherited release is part of the cumulative diff, not completion of this task.
 For Spring error rendering inspect ErrorController, advice, security and actual
 MVC routing. Unit tests of a helper alone do not prove /error handling works.
+Read application.properties for error auto-configuration exclusions when relevant.
 Never change
 build, configuration, migrations or deployment policy. Tools do not provide a
 shell or deployment capability. Use exact unique old/new text replacements.
@@ -211,7 +214,7 @@ def _fit_messages(initial, turns, tools, settings):
     budget instead of assuming four characters/token and unexpectedly overspend.
     """
     budget = settings.max_context_tokens - settings.max_output_tokens - 256
-    turns = list(turns[-3:])
+    turns = list(turns[-24:])
     # The user's requested behavior is not expendable context. Trim evidence,
     # never silently cut the goal (e.g. its last requirement about HTTP codes).
     protected_goal, extra, extra_limit = None, '', 0
@@ -277,15 +280,17 @@ async def _write_patch(job_id, incident_id, workspace_id, model, compact, goal, 
     # Prioritize failures and CURRENT file reads over long original logs/diffs.
     # Otherwise JSON-string truncation can silently drop all repair evidence.
     verified = []
-    for item in research[-3:]:
+    for item in research[-8:]:
         if isinstance(item, str):
             try:
                 item = json.loads(item)
             except ValueError:
                 item = {'snippet': item[:3500]}
         if isinstance(item, dict):
-            verified.append({**item, **({'content': item['content'][:3500]} if isinstance(item.get('content'), str) else {})})
-    payload = {'goal': goal, 'existing_files': compact.get('current_workspace', {}).get('changed_files', []),
+            verified.append({**item, **({'content': item['content'][:10000]} if isinstance(item.get('content'), str) else {})})
+    existing = set(compact.get('current_workspace', {}).get('changed_files', []))
+    existing.update(item['path'] for item in verified if isinstance(item.get('path'), str))
+    payload = {'goal': goal, 'existing_files': sorted(existing),
                'deployment_failure': compact.get('deployment_failure'),
                'current_tests': compact.get('current_tests'),
                'research': verified,
@@ -330,9 +335,10 @@ async def _agent(job_id, incident_id, workspace_id, model, evidence, goal, spent
                {'role': 'user', 'content': json.dumps({'goal': goal, 'evidence': _safe(compact, 4000)}, ensure_ascii=False)}]
     iterations = iteration_limit()
     research_steps = min(2, max(1, iterations - 2))
-    research = evidence.get('previous_research', [])
+    research = list(evidence.get('previous_research', []))
     turns, summary = [], ''
     last_json_iteration = None
+    stagnant_turns = 0
     diff = await runner_call('tool', {'workspace_id': workspace_id, 'action': 'git_diff'})
     tested_sha = None
     deployment_failure = evidence.get('deployment_failure')
@@ -354,13 +360,18 @@ async def _agent(job_id, incident_id, workspace_id, model, evidence, goal, spent
         completed = False
         edited = bool(diff.get('patch'))
         task_edited = edited and diff.get('patch_sha') != evidence.get('inherited_patch_sha')
-        # JSON is a bootstrap fallback, never a permanent repair mode. Once the
-        # task has edits, keep read/search/edit tools available even after several
-        # stagnant turns. Failed JSON proposals must also yield to tool research.
-        write_phase = (not task_edited and local_iteration >= research_steps and
-                       (last_json_iteration is None or local_iteration - last_json_iteration >= 3))
+        # Break prolonged read-only loops, including with a partial patch. Tools
+        # remain available between attempts; JSON is never a permanent phase.
+        write_phase = (((not task_edited and local_iteration >= research_steps) or
+                        stagnant_turns >= STAGNANT_TURNS_BEFORE_PATCH) and
+                        (last_json_iteration is None or local_iteration - last_json_iteration >= 3))
+        before_sha = diff.get('patch_sha')
         if write_phase:
             last_json_iteration = local_iteration
+            if stagnant_turns >= STAGNANT_TURNS_BEFORE_PATCH:
+                await _event(job_id, 'progress', {'stagnant_turns': stagnant_turns,
+                                                  'action': 'write_patch',
+                                                  'reason': 'Repeated inspection without patch progress'})
             try:
                 patch_context = {**compact, 'current_tests': validation, 'deployment_failure': deployment_feedback,
                                  'current_workspace': {**diff, 'patch': diff.get('patch', '')[:3500]}}
@@ -381,10 +392,14 @@ async def _agent(job_id, incident_id, workspace_id, model, evidence, goal, spent
             # Pin the latest failure after history trimming. Long diffs or
             # repeated file reads must not evict the reason tests/deploy failed.
             state = {'deployment_failure': deployment_feedback,
-                     'tests': _current_checks(validation), 'changed_files': diff.get('changed_files', []),
+                      'tests': _current_checks(validation), 'changed_files': diff.get('changed_files', []),
+                      'already_read_files': list(dict.fromkeys(item['path'] for item in research
+                                                if isinstance(item, dict) and isinstance(item.get('path'), str)))[-16:],
+                      'turns_without_patch_progress': stagnant_turns,
                      'instruction': ('Tests passing is not completion: repair the deployment failure with a changed patch.'
                                       if deployment_feedback else
-                                      'Complete all requested behavior and regression tests. Repair failing checks without disabling assertions. '
+                                       'Complete all requested behavior and regression tests. Repair failing checks without disabling assertions. '
+                                       'Avoid rereading unchanged files already shown; make the remaining edits. '
                                       'If the task is complete and checks pass, return a final summary WITHOUT tool calls.')}
             current = [{'role': 'user', 'content': _safe(state, 8500)}]
             # The failure is pinned separately. Putting it last in history made
@@ -419,7 +434,11 @@ async def _agent(job_id, incident_id, workspace_id, model, evidence, goal, spent
                         raise ValueError('Reserved runner parameters')
                     result = await _tool_call(job_id, workspace_id, name, arguments)
                     if name == 'file_read':
+                        research = [item for item in research if not (isinstance(item, dict)
+                                    and item.get('path') == result.get('path')
+                                    and item.get('start_line') == result.get('start_line'))]
                         research.append(result)
+                        research = research[-16:]
                     result_text = _safe(_test_feedback(result) if name == 'run_allowed_tests' else result, 7000)
                 except (ValueError, httpx.HTTPStatusError) as exc:
                     result_text = json.dumps({'error': _error(exc)}, ensure_ascii=False)
@@ -428,6 +447,7 @@ async def _agent(job_id, incident_id, workspace_id, model, evidence, goal, spent
             turns.append(turn)
 
         diff = await runner_call('tool', {'workspace_id': workspace_id, 'action': 'git_diff'})
+        stagnant_turns = 0 if diff.get('patch_sha') != before_sha else stagnant_turns + 1
         # Validate EVERY changed patch, before another model turn. The JSON edit
         # phase must not return early and hide failing tests from the agent.
         if diff.get('patch') and diff['patch_sha'] != tested_sha:
@@ -461,7 +481,7 @@ async def prepare_fix(job_id: int):
         incident_id, requested, goal = job.incident_id, job.model, job.goal
         spent_calls = used_calls(job_id, session)
         previous_research = [event.get('data', {}).get('result', '') for event in job.events
-                             if event.get('kind') == 'tool_result' and event.get('data', {}).get('name') == 'file_read'][-3:]
+                              if event.get('kind') == 'tool_result' and event.get('data', {}).get('name') == 'file_read'][-8:]
         previous_tests = job.tests
         previous_deploy = session.scalars(select(Deployment).where(Deployment.fix_job_id == job_id)
                                          .order_by(Deployment.id.desc())).first()
@@ -495,7 +515,7 @@ async def prepare_fix(job_id: int):
         with Session.begin() as session:
             session.get(FixJob, job_id).model = model
         summary, reason = await asyncio.wait_for(
-            _agent(job_id, incident_id, workspace_id, model, evidence, goal, spent_calls), 3600)
+            _agent(job_id, incident_id, workspace_id, model, evidence, goal, spent_calls), MAX_PREPARATION_SECONDS)
     except FixBudgetExceeded as exc:
         reason = str(exc)
     except asyncio.TimeoutError:

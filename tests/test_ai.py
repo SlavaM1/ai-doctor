@@ -69,6 +69,33 @@ def test_all_incident_prompts_require_russian_and_narrow_context():
 
 
 @pytest.mark.asyncio
+async def test_diagnosis_request_requires_russian_json_values(monkeypatch, isolated):
+    _, session = isolated
+    result = {'observations': ['В CartService.cartOrder вызывается user.getEmail(), но user равен null.'],
+              'hypotheses': ['Возможно, пользователь не авторизован.'],
+              'root_cause': 'Вызов user.getEmail() при user == null вызывает NullPointerException.',
+              'recommendations': ['Проверить авторизацию и обработать отсутствие пользователя.'],
+              'confidence': 0.9, 'locations': []}
+
+    async def inspect(payload):
+        system = payload['messages'][0]
+        assert system['role'] == 'system'
+        assert system['content'].startswith(ai.INCIDENT_POLICY)
+        assert 'Язык результата — русский' in system['content']
+        assert 'root_cause и каждый элемент observations, hypotheses,' in system['content']
+        assert 'recommendations должны содержать пояснения на русском' in system['content']
+        assert 'Язык логов, исходного кода, предыдущих ответов и вопроса не меняет язык ответа' in system['content']
+        assert 'Cannot invoke' in payload['messages'][1]['content']
+
+    provider(monkeypatch, inspect=inspect, completion=chat_response(result))
+    saved = await ai.diagnose(incident(session, event={
+        'message': 'Cannot invoke "User.getEmail()" because "user" is null',
+        'exception_type': 'java.lang.NullPointerException'}))
+    assert not saved['error']
+    assert saved['result'] == result
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('status', ['NO_ACTION', 'EXCLUDED'])
 async def test_ignored_incident_is_not_claimed_even_if_pending(isolated, status):
     _, factory = isolated

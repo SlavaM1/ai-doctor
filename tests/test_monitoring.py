@@ -56,6 +56,30 @@ def test_info_debug_and_independent_errors():
     assert len(parser.flush(True)) == 1
 
 
+def test_distinct_servlet_failures_survive_batches_and_repeats(store):
+    # Real Tomcat format: the exception also appears in the ERROR header.
+    payload = {'project': 'day35-aurelspa', 'service': 'app', 'container_id': 'cid', 'version': 'rev'}
+    failures = [('org.springframework.mail.MailSendException', 'Mail server connection failed'),
+                ('java.lang.NumberFormatException', 'For input string: "doctor-repro"'),
+                ('java.lang.IllegalArgumentException', 'Page size must not be less than one!')]
+    for index, (exception, message) in enumerate(failures):
+        payload['records'] = [record(
+            '2026-10-17 07:54:00.100 ERROR [traceId=] 1 --- [nio-8080-exec-5] '
+            'o.a.c.c.C.[.[.[/].[dispatcherServlet] : Servlet.service() threw exception '
+            f'[Request processing failed; nested exception is {exception}: {message}] with root cause', f'{index}-header')]
+        m.ingest_batch(payload)
+        payload['records'] = [record(f'{exception}: {message}', f'{index}-exception'),
+                              record('\tat com.aurel.Service.run(Service.java:42)', f'{index}-frame'),
+                              record('2026-10-17 07:54:01.100 INFO request completed', f'{index}-end')]
+        m.ingest_batch(payload)
+        m.ingest_batch(payload)  # Delivery retries must not add occurrences.
+    with store() as session:
+        incidents = list(session.scalars(select(Incident).order_by(Incident.id)))
+        assert [i.exception_type for i in incidents] == [failure[0] for failure in failures]
+        assert all(i.occurrences == 1 for i in incidents)
+        assert session.query(Occurrence).count() == 3
+
+
 def test_error_with_retry_never_ignored(store):
     with store.begin() as session:
         assert m.significant(java_event(), session)

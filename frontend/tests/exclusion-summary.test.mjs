@@ -11,7 +11,7 @@ const { outputText } = ts.transpileModule(source, { compilerOptions: {
 const module = { exports: {} }
 const mockedRequire = name => name === './components' ? { number: value => value ?? '—' } : require(name)
 new Function('require', 'module', 'exports', outputText)(mockedRequire, module, module.exports)
-const { default: ExclusionSummary, exclusionStatuses } = module.exports
+const { default: ExclusionSummary, ExcludedNotice, exclusionStatuses } = module.exports
 const React = require('react')
 const { renderToStaticMarkup } = require('react-dom/server')
 
@@ -27,4 +27,20 @@ test('exclusions always offer both ignored statuses and clear lifetime/window co
 test('unknown counters are not shown as zero', () => {
   const html = renderToStaticMarkup(React.createElement(ExclusionSummary))
   assert.equal((html.match(/<strong>—<\/strong>/g) || []).length, 4)
+})
+
+test('overview explains collected errors hidden by exclusions and offers navigation', () => {
+  const html = renderToStaticMarkup(React.createElement(ExcludedNotice, { stats: {
+    excluded_incidents: 1, excluded_errors_hour: 5,
+  }, onOpen() {} }))
+  assert.match(html, /Ошибки в исключениях: 1/)
+  assert.match(html, /За последний час: 5 повторений/)
+  assert.match(html, /учитываются в счётчиках/)
+  assert.match(html, /Показать исключённые ошибки/)
+})
+
+test('overview does not invent excluded errors while loading or without exclusions', () => {
+  for (const stats of [undefined, { excluded_incidents: 0 }]) {
+    assert.equal(renderToStaticMarkup(React.createElement(ExcludedNotice, { stats, onOpen() {} })), '')
+  }
 })

@@ -12,7 +12,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import select, func, delete
-from .config import get_settings
+from .config import get_settings, MAX_AGENT_ITERATIONS, MAX_CONTEXT_TOKENS, MAX_OUTPUT_TOKENS
 from .db import Session, init_db, Incident, Occurrence, Diagnosis, FixJob, Deployment, AgentRun, State, IncidentLogWindow, ExclusionRule, LoginSession, serialize, now, next_id
 from . import auth
 from .exclusions import signature
@@ -690,9 +690,9 @@ class SettingsUpdate(BaseModel):
     warn_threshold: int | None = Field(None, ge=1, le=1000)
     warn_window_seconds: int | None = Field(None, ge=1, le=3600)
     diagnosis_cooldown_seconds: int | None = Field(None, ge=60, le=86400)
-    max_context_tokens: int | None = Field(None, ge=1000, le=24000)
-    max_output_tokens: int | None = Field(None, ge=256, le=8000)
-    max_agent_iterations: int | None = Field(None, ge=1, le=30)
+    max_context_tokens: int | None = Field(None, ge=1000, le=MAX_CONTEXT_TOKENS)
+    max_output_tokens: int | None = Field(None, ge=256, le=MAX_OUTPUT_TOKENS)
+    max_agent_iterations: int | None = Field(None, ge=1, le=MAX_AGENT_ITERATIONS)
 
 
 @app.patch('/settings')

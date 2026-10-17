@@ -56,6 +56,31 @@ def test_delete_confirmation_links_pending_work_and_id_nonreuse(controls):
     assert client.get('/incidents/1').status_code == 404
 
 
+def test_deleted_incident_is_not_replayed_but_a_new_failure_is_captured(controls, monkeypatch):
+    from doctor import monitoring
+    from doctor.db import Occurrence
+    client, factory, headers = controls
+    monkeypatch.setattr(monitoring, 'Session', factory)
+    payload = {'project': monitoring.get_settings().compose_project, 'service': 'spring',
+               'container_id': 'delete-repro', 'version': 'rev', 'records': [
+                   {'id': 'failure', 'timestamp': '2026-10-17T07:54:00Z',
+                    'text': '2026-10-17 07:54:00 ERROR java.lang.NumberFormatException: invalid page'},
+                   {'id': 'end', 'timestamp': '2026-10-17T07:54:01Z',
+                    'text': '2026-10-17 07:54:01 INFO done'}]}
+    incident_id, = monitoring.ingest_batch(payload)['new_incidents']
+    assert client.request('DELETE', f'/incidents/{incident_id}', headers=headers,
+                          json={'confirmed': True}).status_code == 200
+    assert monitoring.ingest_batch(payload)['new_incidents'] == []
+    with factory() as session:
+        assert session.get(monitoring.LogReceipt, 'failure') is not None
+        assert session.get(Incident, incident_id) is None
+        assert session.query(Occurrence).count() == 0
+    payload['records'] = [{**row, 'id': row['id'] + '-new'} for row in payload['records']]
+    new_id, = monitoring.ingest_batch(payload)['new_incidents']
+    assert new_id > incident_id
+    assert client.get(f'/incidents/{new_id}').json()['incident']['exception_type'] == 'java.lang.NumberFormatException'
+
+
 def test_fix_upfront_deploy_authorization_must_be_explicit_and_is_persisted(controls, monkeypatch):
     from doctor import ai
     from doctor.db import State
@@ -106,11 +131,50 @@ def test_fix_detail_exposes_exhausted_tool_budget_without_reset(controls, monkey
     monkeypatch.setattr(fixing, 'Session', factory)
     with factory.begin() as session:
         session.add(FixJob(id=1, incident_id=1, status='BUDGET_EXHAUSTED'))
-        session.add(State(key='fix-tools:1', value={'calls': 60}))
+        session.add(State(key='fix-tools:1', value={'calls': fixing.MAX_TOOL_CALLS}))
     detail = client.get('/fixes/1').json()
     assert detail['remaining_calls'] > 0
-    assert detail['tool_calls_used'] == 60 and detail['remaining_tool_calls'] == 0
+    assert detail['tool_calls_used'] == fixing.MAX_TOOL_CALLS and detail['remaining_tool_calls'] == 0
     assert client.post('/fixes/1/continue', headers=headers, json={}).status_code == 409
+
+
+def test_explicitly_increased_limits_reopen_old_budget_without_resetting_usage(controls, monkeypatch):
+    from doctor import fixing
+    from doctor.config import Settings
+    from doctor.db import State
+    client, factory, headers = controls
+    cfg = Settings().model_copy(update={'max_agent_iterations': 30})
+    monkeypatch.setattr(main, 'get_settings', lambda: cfg)
+    monkeypatch.setattr(fixing, 'get_settings', lambda: cfg)
+    monkeypatch.setattr(fixing, 'Session', factory)
+    with factory.begin() as session:
+        session.add(FixJob(id=1, incident_id=1, status='BUDGET_EXHAUSTED', workspace='job-1'))
+        session.flush()
+        session.add(AgentRun(incident_id=1, kind='fix', calls=30))
+        session.add(State(key='fix-tools:1', value={'calls': 60}))
+        session.add(State(key='fix-policy:1', value={'auto_deploy': True, 'confirmed_at': 'original approval'}))
+    assert client.post('/fixes/1/continue', headers=headers, json={}).status_code == 409
+    maximums = {'max_agent_iterations': 200, 'max_context_tokens': 128000, 'max_output_tokens': 16000}
+    response = client.patch('/settings', headers=headers, json=maximums)
+    assert response.status_code == 200
+    assert all(response.json()[key] == value for key, value in maximums.items())
+    detail = client.get('/fixes/1').json()
+    assert detail['calls_used'] == 30 and detail['remaining_calls'] == 170
+    assert detail['tool_calls_used'] == 60 and detail['remaining_tool_calls'] == 940
+    resumed = client.post('/fixes/1/continue', headers=headers, json={})
+    assert resumed.status_code == 200 and resumed.json()['spent_calls'] == 30
+    with factory() as session:
+        assert session.get(FixJob, 1).workspace == 'job-1'
+        assert session.get(State, 'fix-tools:1').value == {'calls': 60}
+        assert session.get(State, 'fix-policy:1').value['confirmed_at'] == 'original approval'
+        assert all(session.get(State, 'settings').value[key] == value for key, value in maximums.items())
+
+
+@pytest.mark.parametrize('key,value', [('max_agent_iterations', 201), ('max_context_tokens', 128001),
+                                       ('max_output_tokens', 16001)])
+def test_expanded_limits_are_still_bounded(controls, key, value):
+    client, _, headers = controls
+    assert client.patch('/settings', headers=headers, json={key: value}).status_code == 422
 
 
 def test_continue_can_change_goal_without_new_workspace_or_budget_and_revoke_auto_deploy(controls, monkeypatch):
