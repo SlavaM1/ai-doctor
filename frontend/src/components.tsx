@@ -40,22 +40,22 @@ export function Empty({ title, children, icon = 'pulse' }: { title: string; chil
   return <div className="empty"><span className="empty-icon"><Icon name={icon} size={26} /></span><h3>{title}</h3>{children && <p>{children}</p>}</div>
 }
 
-export function ModelSelect({ value, onChange, models, label = 'Model', configured }: { value: string; onChange: (value: string) => void; models: Model[]; label?: string; configured?: string }) {
+export function ModelSelect({ value, onChange, models, label = 'Модель', configured }: { value: string; onChange: (value: string) => void; models: Model[]; label?: string; configured?: string }) {
   return <label className="model-select"><span>{label}</span><select value={value} onChange={event => onChange(event.target.value)}>
-    <option value="">{configured ? `Default: ${configured}` : 'Use server default'}</option>
+    <option value="">{configured ? `По умолчанию: ${configured}` : 'По умолчанию на сервере'}</option>
     {models.map(model => <option key={model.id} value={model.id}>{model.id}</option>)}
-    {value && !models.some(model => model.id === value) && <option value={value}>{value} (configured)</option>}
+    {value && !models.some(model => model.id === value) && <option value={value}>{value} (настроена)</option>}
   </select></label>
 }
 
 export function date(value?: string) {
-  if (!value) return 'Not reported'
+  if (!value) return 'Нет данных'
   const parsed = new Date(value)
-  return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+  return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString('ru-RU', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
 }
 
 export function number(value?: number) {
-  return typeof value === 'number' ? new Intl.NumberFormat().format(value) : '—'
+  return typeof value === 'number' ? new Intl.NumberFormat('ru-RU').format(value) : '—'
 }
 
 export function text(value: unknown): string {
@@ -64,8 +64,8 @@ export function text(value: unknown): string {
 }
 
 export function DataValue({ value }: { value: unknown }) {
-  if (value == null || value === '') return <span className="muted">Not reported</span>
-  if (Array.isArray(value)) return value.length ? <ul className="data-list">{value.map((entry, index) => <li key={index}><DataValue value={entry} /></li>)}</ul> : <span className="muted">None reported</span>
+  if (value == null || value === '') return <span className="muted">Нет данных</span>
+  if (Array.isArray(value)) return value.length ? <ul className="data-list">{value.map((entry, index) => <li key={index}><DataValue value={entry} /></li>)}</ul> : <span className="muted">Нет записей</span>
   if (typeof value === 'object') return <pre className="structured-data">{text(value)}</pre>
   return <span className="prose">{String(value)}</span>
 }
@@ -80,7 +80,7 @@ export function ConfirmDialog({ title, children, onClose }: { title: string; chi
     return () => element?.close()
   }, [])
   return <dialog ref={dialog} className="confirm-dialog" aria-labelledby="dialog-title" onCancel={event => { event.preventDefault(); close.current() }}>
-    <div className="dialog-heading"><span className="shield-icon"><Icon name="shield" size={24} /></span><button className="icon-button" aria-label="Close confirmation" onClick={onClose}><Icon name="close" /></button></div>
+    <div className="dialog-heading"><span className="shield-icon"><Icon name="shield" size={24} /></span><button className="icon-button" aria-label="Закрыть подтверждение" onClick={onClose}><Icon name="close" /></button></div>
     <h2 id="dialog-title">{title}</h2>{children}
   </dialog>
 }

@@ -13,11 +13,11 @@ export async function request<T>(path: string, options?: RequestInit): Promise<T
   const text = await response.text()
   let value: unknown
   try { value = text ? JSON.parse(text) : null } catch {
-    throw new Error(response.ok ? 'The API returned a non-JSON response. Check the /api proxy.' : `API request failed (${response.status}).`)
+    throw new Error(response.ok ? 'API вернул ответ не в формате JSON. Проверьте прокси /api.' : `Ошибка запроса к API (${response.status}).`)
   }
   if (!response.ok) {
     const detail = value && typeof value === 'object' && 'detail' in value ? (value as { detail: unknown }).detail : value
-    throw new Error(typeof detail === 'string' ? detail : `API request failed (${response.status})${detail ? `: ${JSON.stringify(detail)}` : '.'}`)
+    throw new Error(typeof detail === 'string' ? detail : `Ошибка запроса к API (${response.status})${detail ? `: ${JSON.stringify(detail)}` : '.'}`)
   }
   return value as T
 }
