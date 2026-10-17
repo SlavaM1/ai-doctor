@@ -4,6 +4,7 @@ import { canDeploy, testsPassed } from './deployment'
 import { Badge, ConfirmDialog, DataValue, date, Empty, ErrorNotice, Icon, ModelSelect, number, statusTone, text } from './components'
 import { label } from './labels'
 import type { Diagnosis, FixJob, IncidentDetail, JsonObject, Model, Settings } from './types'
+import { IncidentControls, ManualGit, SessionLog } from './IncidentControls'
 
 function DiagnosisResult({ diagnosis }: { diagnosis: Diagnosis }) {
   const result = diagnosis.result || {}
@@ -106,6 +107,7 @@ function FixReview({ job, refresh, onError, stale }: { job: FixJob; refresh: () 
     <details className="result-details"><summary>События агента ({job.events?.length || 0})</summary>{job.events?.length ? <ol className="agent-events">{job.events.map((event, index) => <li key={index}><DataValue value={event} /></li>)}</ol> : <p className="muted">События агента пока не получены.</p>}</details>
     <div className="deploy-bar"><div><Icon name="shield" size={17} /><span>{eligible ? 'Перед одобрением проверьте изменения и тесты.' : 'Нужны готовое исправление, хеш изменений и успешные тесты.'}</span></div><button className="button primary" disabled={!eligible || deploying} onClick={() => { setAcknowledged(false); setDeployError(''); setApproval({ id: job.id, sha: job.patch_sha }) }}><Icon name="deployments" size={16} />Одобрить и развернуть</button></div>
     {result !== undefined && <div className="action-result" role="status"><strong>Запрос на развёртывание принят</strong><DataValue value={result} /></div>}
+    <ManualGit job={job} stale={stale} />
     {approval && <ConfirmDialog title="Одобрить и развернуть эти изменения?" onClose={() => { if (!deploying) setApproval(null) }}>
       <p>Проверенные изменения будут отправлены исполнителю развёртывания. Это изменит целевое приложение; сама подготовка исправления его не меняет.</p>
       <dl className="approval-facts"><div><dt>Исправление</dt><dd>#{approval.id}</dd></div><div><dt>Тесты</dt><dd>{passed ? 'Пройдены, по данным API' : 'Больше не проходят'}</dd></div><div><dt>Точный SHA изменений</dt><dd><code>{approval.sha}</code></dd></div></dl>
@@ -120,6 +122,7 @@ function FixReview({ job, refresh, onError, stale }: { job: FixJob; refresh: () 
 export default function IncidentPanel({ id, revision, refresh, models, settings }: { id: number; revision: number; refresh: () => void; models: Model[]; settings?: Settings }) {
   const detail = useApi<IncidentDetail>(`/incidents/${id}`, revision)
   const [sourceOpen, setSourceOpen] = useState(false)
+  const [evidenceTab, setEvidenceTab] = useState<'source' | 'log'>('source')
   const source = useApi<unknown>(sourceOpen ? `/incidents/${id}/source` : null, revision)
   const [diagnosisModel, setDiagnosisModel] = useState('')
   const [fixModel, setFixModel] = useState('')
@@ -172,13 +175,17 @@ export default function IncidentPanel({ id, revision, refresh, models, settings 
   ].sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime())
 
   return <article className="incident-detail" aria-label={`Инцидент ${id}`}>
+    <IncidentControls key={`${id}-${incident.status}`} id={id} status={incident.status} refresh={refresh} />
     {detail.error && <ErrorNotice>Не удалось обновить данные; показан последний загруженный инцидент. {detail.error}</ErrorNotice>}
     <header className="incident-heading"><div className="incident-kicker"><span className="mono">INC-{incident.id}</span><Badge tone={statusTone(incident.severity)}>{label(incident.severity)}</Badge><Badge tone={statusTone(incident.status)}>{label(incident.status)}</Badge></div><h2>{incident.exception_type || 'Инцидент приложения'}</h2><p>{incident.message || 'Сообщение об инциденте отсутствует.'}</p><div className="incident-meta"><span><Icon name="source" size={14} />{incident.service || 'Сервис не указан'}</span>{incident.version && <span className="mono">{incident.version}</span>}<span><Icon name="clock" size={14} />{date(incident.last_seen)}</span><span>Повторений: {number(incident.occurrences)}</span></div></header>
 
     <section className="work-section evidence-section"><div className="section-heading"><h3><Icon name="source" />Данные и исходный код</h3></div>
+      <div className="intent-switch evidence-tabs" role="group" aria-label="Просмотр данных"><button type="button" aria-pressed={evidenceTab === 'source'} className={evidenceTab === 'source' ? 'selected' : ''} onClick={() => setEvidenceTab('source')}>Ошибка и исходный код</button><button type="button" aria-pressed={evidenceTab === 'log'} className={evidenceTab === 'log' ? 'selected' : ''} onClick={() => setEvidenceTab('log')}>Лог сессии</button></div>
+      {evidenceTab === 'log' ? <SessionLog id={id} revision={revision} /> : <>
       {trace ? <pre className="code-block stack-trace">{text(trace)}</pre> : <p className="inline-empty">В этом инциденте нет трассировки стека.</p>}
       <details className="result-details"><summary>Зафиксированное событие</summary><DataValue value={event} /></details>
       <details className="result-details" open={sourceOpen} onToggle={event => setSourceOpen(event.currentTarget.open)}><summary>Просмотр исходного кода <span className="muted">Только для чтения</span></summary>{source.error ? <ErrorNotice>{source.error}</ErrorNotice> : source.loading && !source.data ? <p className="muted">Загрузка контекста исходного кода…</p> : source.data != null ? <SourcePreview value={source.data} /> : <p className="muted">Контекст исходного кода не получен.</p>}</details>
+      </>}
     </section>
 
     <section className="work-section"><div className="section-heading"><h3><Icon name="pulse" />Диагностика</h3><Badge tone={statusTone(incident.diagnosis_status)}>{label(incident.diagnosis_status)}</Badge></div>

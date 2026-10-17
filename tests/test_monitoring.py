@@ -145,3 +145,108 @@ def test_trace_is_size_bounded():
     for i in range(100):
         parser.feed(record('  at ' + 'x' * 8000, i + 1), 'app', 'abc', '')
     assert len(parser.flush(True)[0]['stack_trace']) <= m.MAX_TRACE
+
+
+def test_no_action_never_reopens_or_schedules_diagnosis(store):
+    with store.begin() as session:
+        incident_id, _ = m.store_event(session, java_event(source='initial'))
+        incident = session.get(Incident, incident_id)
+        incident.status, incident.diagnosis_status = 'NO_ACTION', 'SKIPPED'
+        session.add(State(key=f'cooldown:{incident_id}', value={'until': 0}))
+    with store.begin() as session:
+        _, created = m.store_event(session, java_event(source='repeat'))
+        incident = session.get(Incident, incident_id)
+        assert not created and incident.status == 'NO_ACTION' and incident.diagnosis_status == 'SKIPPED'
+        assert incident.occurrences == 2
+    assert m.release_cooldowns() == []
+
+
+def test_session_log_five_neighbors_grouping_multiline_and_later_batches(store):
+    from doctor.db import IncidentLogWindow, SessionLogEvent
+    def entry(index, level='INFO', trace='session-a', text='event'):
+        return record(f'2026-10-16 18:00:00 {level} traceId={trace} {text} {index}', str(index))
+    payload = {'project': 'day35-aurelspa', 'service': 'app', 'container_id': 'cid', 'records': []}
+    payload['records'] = [entry(i) for i in range(8)] + [entry(8, trace='other')] + [entry(9, 'ERROR', text='password=hidden-value failure')]
+    m.ingest_batch(payload)
+    payload['records'] = [record('java.lang.IllegalStateException: broken', 'stack'), entry(10), entry(11, trace='other')]
+    m.ingest_batch(payload)
+    with store() as session:
+        incident = session.scalar(select(Incident))
+        incident_id = incident.id
+        data = session.get(IncidentLogWindow, incident_id).data
+        assert len(data['before']) == 5 and len(data['after']) == 1
+        assert all(item['trace_id'] == 'session-a' for item in data['before'] + data['after'])
+        assert data['before'][0]['text'].endswith('event 3')
+        assert 'IllegalStateException' in data['error']['text']
+        assert 'hidden-value' not in repr(data)
+    payload['records'] = [entry(i) for i in range(12, 20)]
+    changed = m.ingest_batch(payload)['changed']
+    assert incident_id in changed
+    m.ingest_batch(payload)  # retries do not duplicate context
+    with store() as session:
+        data = session.get(IncidentLogWindow, incident_id).data
+        assert len(data['after']) == 5 and data['after'][-1]['text'].endswith('event 15')
+        assert session.query(SessionLogEvent).count() == 20
+
+
+def test_session_log_fallback_ring_bound_and_snapshot_survives_pruning(store, monkeypatch):
+    from doctor import session_logs
+    from doctor.db import SessionLogEvent, IncidentLogWindow
+    monkeypatch.setattr(session_logs, 'RING_LIMIT', 8)
+    payload = {'project': 'day35-aurelspa', 'service': 'app', 'container_id': 'cid', 'records': [
+        record(f'2026-10-16 18:00:00 {"ERROR" if i == 3 else "INFO"} event {i}', str(i)) for i in range(10)]}
+    m.ingest_batch(payload)
+    with store() as session:
+        data = session.scalar(select(IncidentLogWindow)).data
+        assert not data['trace_id'] and len(data['before']) == 3 and len(data['after']) == 5
+        assert session.query(SessionLogEvent).count() == 8
+    payload['records'] = [record(f'2026-10-16 18:00:00 INFO later {i}', str(i)) for i in range(10, 30)]
+    m.ingest_batch(payload)
+    with store() as session:
+        assert session.scalar(select(IncidentLogWindow)).data == data
+        assert session.query(SessionLogEvent).count() == 8
+
+
+def test_aurelspa_mdc_bracket_uuid_and_empty_trace_id(store):
+    from doctor.db import IncidentLogWindow
+    from doctor.session_logs import TRACE_ID
+    trace = '3c49872e-94ea-458c-b4e0-621f77c9e8ec'
+    assert TRACE_ID.search(f'[traceId={trace}]').group(1) == trace
+    assert TRACE_ID.search('[traceId=]') is None
+    payload = {'project': 'day35-aurelspa', 'service': 'app', 'container_id': 'cid', 'records': [
+        record(f'2026-10-17 10:00:00.100 INFO [http-1] [traceId={trace}] com.aurel.Service : request started', '1'),
+        record('2026-10-17 10:00:00.101 INFO [main] [traceId=] com.aurel.Service : background work', '2'),
+        record(f'2026-10-17 10:00:00.102 ERROR [http-1] [traceId={trace}] com.aurel.Service : request failed', '3'),
+        record('java.lang.IllegalStateException: bad input', '4'),
+        record(f'2026-10-17 10:00:00.103 INFO [http-2] [traceId={trace}] com.aurel.Service : request completed', '5'),
+    ]}
+    m.ingest_batch(payload)
+    with store() as session:
+        data = session.scalar(select(IncidentLogWindow)).data
+        assert data['trace_id'] == trace
+        assert len(data['before']) == len(data['after']) == 1
+        assert 'background work' not in repr(data)
+        assert 'IllegalStateException' in data['error']['text']
+
+
+def test_later_trace_logs_fill_snapshot_even_after_anchor_evicted(store, monkeypatch):
+    from doctor import session_logs
+    from doctor.db import IncidentLogWindow, SessionLogEvent
+    monkeypatch.setattr(session_logs, 'RING_LIMIT', 8)
+    payload = {'project': 'day35-aurelspa', 'service': 'app', 'container_id': 'cid', 'records': [
+        record('2026-10-17 10:00:00 INFO [traceId=target] before', 'before'),
+        record('2026-10-17 10:00:00 ERROR [traceId=target] error', 'error'),
+        record('2026-10-17 10:00:00 INFO [traceId=target] first after', 'after'),
+    ]}
+    m.ingest_batch(payload)
+    payload['records'] = [record(f'2026-10-17 10:00:00 INFO [traceId=unrelated] event {i}', str(i)) for i in range(20)]
+    m.ingest_batch(payload)
+    with store() as session:
+        assert not session.scalar(select(SessionLogEvent).where(SessionLogEvent.source_id == 'error'))
+    payload['records'] = [record(f'2026-10-17 10:00:00 INFO [traceId=target] later {i}', str(i)) for i in range(20, 26)]
+    m.ingest_batch(payload)
+    with store() as session:
+        data = session.scalar(select(IncidentLogWindow)).data
+        assert len(data['before']) == 1 and len(data['after']) == 5
+        assert 'first after' in data['after'][0]['text']
+        assert 'later 23' in data['after'][-1]['text']

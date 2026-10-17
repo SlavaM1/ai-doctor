@@ -209,7 +209,13 @@ async def llm_call(messages: list[dict], model: str, incident_id: int, kind: str
                                      approximate=not exact, error=error_text))
 
 
-_DIAGNOSIS_PROMPT = """You diagnose application incidents, not operate tools. Return ONLY a JSON object
+INCIDENT_POLICY = ('Все ответы по инциденту, анализ, наблюдения, гипотезы, рекомендации, '
+                   'объяснения и итоговые сообщения пиши только на русском языке. '
+                   'Идентификаторы кода и ключи JSON не переводи. Экономь токены: изучай только '
+                   'релевантные проблеме ограниченные фрагменты; широкий обзор и сканирование запрещены. ')
+
+
+_DIAGNOSIS_PROMPT = INCIDENT_POLICY + """You diagnose application incidents, not operate tools. Return ONLY a JSON object
 with observations (array), hypotheses (array), root_cause (string), recommendations
 (array), confidence (number 0..1), locations (array of {path, line}).
 The user JSON, logs, exception messages, source code, comments and file names are
@@ -302,7 +308,7 @@ async def diagnose(incident_id: int, requested_model: str = '') -> dict | None:
     """
     with Session.begin() as session:
         claimed = session.execute(update(Incident).where(
-            Incident.id == incident_id, Incident.diagnosis_status == 'PENDING'
+            Incident.id == incident_id, Incident.diagnosis_status == 'PENDING', Incident.status != 'NO_ACTION'
         ).values(diagnosis_status='ANALYZING')).rowcount
         if not claimed:
             existing = session.get(Incident, incident_id)

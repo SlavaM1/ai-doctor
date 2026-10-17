@@ -5,7 +5,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from sqlalchemy import select, delete
 from .config import get_settings
-from .db import Base, Session, State, Incident, Occurrence, Diagnosis, now
+from .db import Base, Session, State, Incident, Occurrence, Diagnosis, now, next_id
 from sqlalchemy.orm import Mapped, mapped_column
 from .security import redact
 
@@ -135,7 +135,7 @@ def store_event(session, event: dict) -> tuple[int | None, bool]:
     incident = session.scalar(select(Incident).where(Incident.fingerprint == fp))
     created = incident is None
     if created:
-        incident = Incident(fingerprint=fp, severity=event['severity'], exception_type=event['exception_type'],
+        incident = Incident(id=next_id(session, Incident), fingerprint=fp, severity=event['severity'], exception_type=event['exception_type'],
                             message=event['message'], root_cause=event['root_cause'], service=event['service'],
                             version=event.get('version', ''), event=event)
         session.add(incident)
@@ -155,16 +155,26 @@ def store_event(session, event: dict) -> tuple[int | None, bool]:
                 incident.diagnosis_status = 'PENDING'
             created = True
     session.add(Occurrence(incident_id=incident.id, source_id=event['source_id']))
+    from .session_logs import snapshot
+    snapshot(session, incident.id, event)
     return incident.id, created
 
 
 def ingest_batch(payload: dict) -> dict:
+    from .session_logs import capture, refresh
     settings = get_settings()
     if payload['service'] not in settings.allowed_services.split(',') or payload['project'] != settings.compose_project:
         raise ValueError('Service/project is not allowlisted')
     records = payload.get('records', [])
-    if len(records) > 1000:
+    if not isinstance(records, list) or len(records) > 1000:
         raise ValueError('Batch too large')
+    if not isinstance(payload['container_id'], str) or not 1 <= len(payload['container_id']) <= 128:
+        raise ValueError('Invalid container id')
+    for record in records:
+        if (not isinstance(record, dict) or not isinstance(record.get('id'), str) or not 1 <= len(record['id']) <= 128
+                or not isinstance(record.get('text'), str) or not isinstance(record.get('timestamp'), str)
+                or len(record['timestamp']) > 100):
+            raise ValueError('Invalid record')
     key = 'parser:' + payload['container_id']
     new_incidents, changed = [], set()
     with Session.begin() as session:
@@ -174,6 +184,7 @@ def ingest_batch(payload: dict) -> dict:
             if session.get(LogReceipt, record['id']):
                 continue
             session.add(LogReceipt(source_id=record['id']))
+            capture(session, record, payload['container_id'])
             for event in parser.feed(record, payload['service'], payload['container_id'], payload.get('version', '')):
                 incident_id, created = store_event(session, event)
                 if incident_id:
@@ -190,6 +201,7 @@ def ingest_batch(payload: dict) -> dict:
             state.value = {**parser.state, 'last_seen_at': time.time()}
         else:
             session.add(State(key=key, value={**parser.state, 'last_seen_at': time.time()}))
+        changed.update(refresh(session, payload['container_id']))
         heartbeat = session.get(State, 'collector')
         value = {'last_seen': now(), 'container_id': payload['container_id'], 'service': payload['service'], 'cursor': payload.get('cursor', ''), 'status': 'connected'}
         if heartbeat:
@@ -217,6 +229,8 @@ def flush_pending() -> dict:
                     changed.append(incident_id)
                 if new:
                     created.append(incident_id)
+            from .session_logs import refresh
+            changed.extend(refresh(session, state.key.split(':', 1)[1]))
     return {'changed': changed, 'new_incidents': created}
 
 
@@ -225,7 +239,7 @@ def release_cooldowns() -> list[int]:
     with Session.begin() as session:
         for state in session.scalars(select(State).where(State.key.like('cooldown:%'))):
             incident = session.get(Incident, int(state.key.split(':')[1]))
-            if not incident or incident.diagnosis_status != 'COOLDOWN':
+            if not incident or incident.status == 'NO_ACTION' or incident.diagnosis_status != 'COOLDOWN':
                 session.delete(state)
             elif state.value.get('until', 0) <= time.time():
                 incident.diagnosis_status = 'PENDING'
@@ -239,6 +253,8 @@ def retention():
     cutoff = (datetime.now(timezone.utc) - timedelta(days=settings.retention_days)).isoformat()
     receipts_cutoff = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
     with Session.begin() as session:
+        from .db import SessionLogEvent
+        session.execute(delete(SessionLogEvent).where(SessionLogEvent.created_at < receipts_cutoff))
         session.execute(delete(Occurrence).where(Occurrence.seen_at < cutoff))
         session.execute(delete(LogReceipt).where(LogReceipt.seen_at < receipts_cutoff))
         # Parser buffers belong to containers; don't retain retired container logs forever.

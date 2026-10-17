@@ -8,6 +8,8 @@ const labels: Record<string, string> = {
   DIAGNOSED: 'Диагностика выполнена',
   FIXING: 'Исправляется',
   RESOLVED: 'Решён',
+  NO_ACTION: 'Не требует решения',
+  SKIPPED: 'Пропущено',
   PENDING: 'Ожидает',
   ANALYZING: 'Анализируется',
   COOLDOWN: 'Пауза перед повторной диагностикой',

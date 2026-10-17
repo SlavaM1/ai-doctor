@@ -59,6 +59,26 @@ def install_http(monkeypatch, handler):
     monkeypatch.setattr(ai.httpx, 'AsyncClient', factory)
 
 
+def test_all_incident_prompts_require_russian_and_narrow_context():
+    from doctor import fixing
+    assert 'только на русском' in ai.INCIDENT_POLICY
+    assert 'широкий обзор и сканирование запрещены' in ai.INCIDENT_POLICY
+    assert ai._DIAGNOSIS_PROMPT.startswith(ai.INCIDENT_POLICY)
+    assert fixing.SYSTEM.startswith(ai.INCIDENT_POLICY)
+    assert not {'branch', 'commit', 'push', 'manual-git'} & fixing.TOOL_NAMES
+
+
+@pytest.mark.asyncio
+async def test_ignored_incident_is_not_claimed_even_if_pending(isolated):
+    _, factory = isolated
+    with factory.begin() as session:
+        session.add(Incident(id=1, fingerprint='ignored', status='NO_ACTION', diagnosis_status='PENDING'))
+    assert await ai.diagnose(1) is None
+    with factory() as session:
+        assert session.query(AgentRun).count() == 0
+        assert session.query(Diagnosis).count() == 0
+
+
 def provider(monkeypatch, *, models=None, completion=None, status=200, inspect=None):
     models = models if models is not None else ['deepseek-flash', 'deepseek-v4-pro']
     requests = []

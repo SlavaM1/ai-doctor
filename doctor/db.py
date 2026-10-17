@@ -1,5 +1,5 @@
-from datetime import datetime, timezone
-from sqlalchemy import create_engine, event, String, Text, Integer, Float, JSON, ForeignKey
+from datetime import datetime, timedelta, timezone
+from sqlalchemy import create_engine, event, String, Text, Integer, Float, JSON, ForeignKey, select, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 from .config import get_settings
 
@@ -98,6 +98,29 @@ class State(Base):
     value: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
+class SessionLogEvent(Base):
+    __tablename__ = 'session_log_events'
+    __table_args__ = {'sqlite_autoincrement': True}
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source_id: Mapped[str] = mapped_column(String(128), unique=True)
+    container_id: Mapped[str] = mapped_column(String(128), index=True)
+    trace_id: Mapped[str] = mapped_column(String(128), default='', index=True)
+    timestamp: Mapped[str] = mapped_column(String(100))
+    text: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[str] = mapped_column(default=now)
+
+
+class IncidentLogWindow(Base):
+    __tablename__ = 'incident_log_windows'
+    incident_id: Mapped[int] = mapped_column(ForeignKey('incidents.id'), primary_key=True)
+    container_id: Mapped[str] = mapped_column(String(128), index=True)
+    anchor_id: Mapped[int] = mapped_column(Integer)
+    trace_id: Mapped[str] = mapped_column(String(128), default='')
+    collecting: Mapped[bool] = mapped_column(default=True, index=True)
+    expires_at: Mapped[str] = mapped_column(default=lambda: (datetime.now(timezone.utc) + timedelta(days=3)).isoformat())
+    data: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
 engine = create_engine(get_settings().database_url, connect_args={'check_same_thread': False, 'timeout': 30})
 
 
@@ -116,3 +139,12 @@ def init_db():
 
 def serialize(row):
     return {column.name: getattr(row, column.name) for column in row.__table__.columns}
+
+
+def next_id(session, model):
+    """Never reuse deleted IDs, including trusted runner workspace job IDs."""
+    key = 'id-sequence:' + model.__tablename__
+    state = session.get(State, key)
+    value = max(session.scalar(select(func.max(model.id))) or 0, state.value.get('last', 0) if state else 0) + 1
+    session.merge(State(key=key, value={'last': value}))
+    return value

@@ -113,6 +113,90 @@ def approved(h, job=1):
     return {'workspace_id': ws, 'patch_sha': diff['patch_sha'], 'confirmed': True}
 
 
+def test_manual_git_branch_from_current_commit_exact_patch_and_no_checkout_changes(harness):
+    h = harness
+    request = {**approved(h), 'branch': 'doctor/test-fix', 'action': 'branch'}
+    base, current_branch = h.runner.head(), git(h.repo, 'symbolic-ref', 'HEAD')
+    created = h.runner.manual_git(request)
+    assert created['base_commit'] == base
+    assert git(h.repo, 'rev-parse', 'doctor/test-fix').strip() == base
+    result = h.runner.manual_git({**request, 'action': 'commit', 'message': 'Проверенное исправление'})
+    commit = result['commit']
+    assert git(h.repo, 'rev-parse', commit + '^').strip() == base
+    assert '"good"' in git(h.repo, 'show', commit + ':' + JAVA)
+    assert h.runner.head() == base and git(h.repo, 'symbolic-ref', 'HEAD') == current_branch
+    assert git(h.repo, 'status', '--porcelain') == ''
+    # Detached fix workspace remains deployable with its original approved hash.
+    assert h.runner.deploy(request)['status'] == 'SUCCEEDED'
+
+
+@pytest.mark.parametrize('branch', ['--evil', 'bad;touch /tmp/pwn', 'a..b', '../bad', 'a//b', 'a/-b', 'a\nb'])
+def test_manual_git_rejects_branch_injection(harness, branch):
+    with pytest.raises(HTTPException):
+        harness.runner.manual_git({**approved(harness), 'action': 'branch', 'branch': branch})
+
+
+def test_manual_git_requires_confirmation_tests_hash_and_explicit_sequence(harness):
+    h = harness
+    request = {**approved(h), 'action': 'branch', 'branch': 'doctor/sequence'}
+    for changed in ({'confirmed': False}, {'patch_sha': '0' * 64}, {'action': 'commit', 'message': 'fix'}, {'action': 'push'}):
+        with pytest.raises(HTTPException):
+            h.runner.manual_git({**request, **changed})
+    for tool in ('branch', 'commit', 'push', 'manual-git'):
+        with pytest.raises(HTTPException):
+            h.runner.tool({**request, 'action': tool})
+
+
+def test_search_requires_narrow_scope_and_read_has_bounded_range(harness):
+    h = harness
+    ws = workspace(h)
+    with pytest.raises(HTTPException):
+        h.runner.tool({'workspace_id': ws, 'action': 'file_search', 'query': 'value'})
+    result = h.runner.tool({'workspace_id': ws, 'action': 'file_search', 'query': 'value', 'path': JAVA})
+    assert len(result['matches']) == 1 and result['matches'][0]['path'] == JAVA
+    with pytest.raises(HTTPException):
+        h.runner.tool({'workspace_id': ws, 'action': 'file_read', 'path': JAVA, 'start_line': 1, 'end_line': 1000})
+
+
+def test_manual_git_rejects_dirty_source_stale_head_and_secret_patch(harness):
+    h = harness
+    request = {**approved(h), 'action': 'branch', 'branch': 'doctor/safety'}
+    (h.repo / 'unrelated.txt').write_text('user work')
+    with pytest.raises(HTTPException):
+        h.runner.manual_git(request)
+    (h.repo / 'unrelated.txt').unlink()
+    path, meta = h.runner.workspace_meta(request['workspace_id'])
+    (path / JAVA).write_text('class Example { String key = "sk-abcdefghijklmnopqrstuv"; }')
+    diff = h.runner.diff(path, meta)
+    meta['tests'] = {'passed': True, 'patch_sha': diff['patch_sha'], 'base_commit': meta['base_commit']}
+    h.runner.save(request['workspace_id'] + '.json', meta)
+    with pytest.raises(HTTPException, match='секреты'):
+        h.runner.manual_git({**request, 'patch_sha': diff['patch_sha']})
+
+
+def test_manual_git_push_only_github_exact_ref_and_never_leaks_output(harness):
+    h = harness
+    request = {**approved(h), 'action': 'branch', 'branch': 'doctor/publish'}
+    h.runner.manual_git(request)
+    h.runner.manual_git({**request, 'action': 'commit', 'message': 'fix'})
+    git(h.repo, 'remote', 'add', 'origin', 'https://user:secret@github.com/org/repo.git')
+    with pytest.raises(HTTPException) as error:
+        h.runner.manual_git({**request, 'action': 'push'})
+    assert 'secret' not in str(error.value.detail)
+    git(h.repo, 'remote', 'set-url', 'origin', 'https://github.com/org/repo.git')
+    original, commands = h.runner.command, []
+    def command(argv, **kwargs):
+        if 'push' in argv:
+            commands.append(argv)
+            return {'returncode': 0, 'output': 'token=private-never-return'}
+        return original(argv, **kwargs)
+    h.runner.command = command
+    result = h.runner.manual_git({**request, 'action': 'push'})
+    assert result['pushed'] is True and 'private-never-return' not in repr(result)
+    assert commands[0][-3:] == ['--porcelain', 'origin', result['commit'] + ':refs/heads/doctor/publish']
+    assert '--force' not in commands[0] and '--no-verify' in commands[0]
+
+
 def test_workspace_uses_exact_detached_head(harness):
     h = harness
     result = h.runner.workspace({'job_id': 1, 'base_commit': git(h.repo, 'rev-parse', 'HEAD').strip()})

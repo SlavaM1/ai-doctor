@@ -47,6 +47,14 @@ code { font-size: .88em; }
 .orange-text { color: var(--orange); }
 .small { font-size: 12px; }
 .wrap { overflow-wrap: anywhere; }
+.incident-controls { display: flex; flex-wrap: wrap; align-items: end; gap: 10px; padding: 12px 0; }
+.incident-controls label, .manual-git > label { display: grid; gap: 5px; font-size: 12px; }
+.incident-controls > p, .incident-controls > .error-notice { flex-basis: 100%; }
+.manual-git > label { margin-top: 12px; }
+.evidence-tabs { margin-bottom: 16px; }
+.session-log-entry { margin: 12px 0; border-left: 2px solid var(--line); padding-left: 12px; }
+.session-log-error { border-left-color: var(--orange); }
+.session-log-error strong { color: var(--orange); }
 .prose { line-height: 1.75; white-space: pre-wrap; overflow-wrap: anywhere; max-width: 78ch; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 

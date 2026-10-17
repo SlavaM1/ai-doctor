@@ -43,9 +43,9 @@ def bounded(value, limit=OUTPUT_LIMIT):
     return str(value)[:limit]
 
 
-def run_command(argv, *, cwd=None, timeout=60, output_limit=OUTPUT_LIMIT):
+def run_command(argv, *, cwd=None, timeout=60, output_limit=OUTPUT_LIMIT, env=None):
     """No shell; drain output without retaining unbounded subprocess output."""
-    process = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL,
+    process = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                start_new_session=True)
     output = bytearray()
@@ -269,9 +269,10 @@ class Runner:
             fail('File missing or too large', 404)
         if _private_content(path.read_bytes()):
             fail('Private key material is not readable', 403)
-        start, end = data.get('start_line', 1), data.get('end_line', 200)
-        if type(start) is not int or type(end) is not int or start < 1 or end < start or end - start > 300:
-            fail('Invalid line range (maximum 301 lines)')
+        start = data.get('start_line', 1)
+        end = data.get('end_line', start + 79 if type(start) is int else 80)
+        if type(start) is not int or type(end) is not int or start < 1 or end < start or end - start > 119:
+            fail('Invalid line range (maximum 120 lines)')
         try:
             lines = path.read_text().splitlines()
         except UnicodeError:
@@ -283,8 +284,13 @@ class Runner:
         query = data.get('query', '')
         if not isinstance(query, str) or not 1 <= len(query) <= 200:
             fail('Search requires 1–200 literal characters')
+        scope = data.get('path', '')
+        safe_path(root, scope)
+        files = [name for name in files if name == scope or name.startswith(scope.rstrip('/') + '/')]
+        if len(files) > 50:
+            fail('Уточните путь поиска: допускается не более 50 релевантных файлов')
         matches, size = [], 0
-        for name in files[:5000]:
+        for name in files:
             path = safe_path(root, name)
             if not path.is_file() or path.stat().st_size > FILE_LIMIT:
                 continue
@@ -621,6 +627,86 @@ class Runner:
                 'status', 'workspace_id', 'patch_sha', 'previous_image', 'image', 'started_at') if key in journal}
         return status
 
+    def manual_git(self, data):
+        """Human-only operation, deliberately absent from tool()/LLM allowlists.
+
+        Source checkout/HEAD stay untouched. Branch starts at CURRENT source HEAD;
+        a temporary index commits only the exact tested patch without hooks.
+        """
+        if data.get('confirmed') is not True:
+            fail('Требуется явное подтверждение пользователя', 403)
+        action, branch = data.get('action'), data.get('branch', '')
+        if action not in {'branch', 'commit', 'push'}:
+            fail('Неизвестное действие Git')
+        if (not isinstance(branch, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9/_-]{0,99}', branch)
+                or any(not part or part.startswith('-') for part in branch.split('/'))):
+            fail('Недопустимое имя ветки')
+        if not re.fullmatch(r'[a-f0-9]{64}', str(data.get('patch_sha', ''))):
+            fail('Требуется точный SHA исправления')
+        with self.locked():
+            path, meta = self.workspace_meta(data.get('workspace_id'))
+            diff = self.diff(path, meta)
+            tests = meta.get('tests') or {}
+            if (not diff['patch'] or diff['patch_sha'] != data['patch_sha'] or tests.get('passed') is not True
+                    or tests.get('patch_sha') != diff['patch_sha'] or tests.get('base_commit') != meta['base_commit']):
+                fail('Подтверждённое исправление изменилось или не прошло тесты', 409)
+            if self.head() != meta['base_commit'] or self.git(self.source, 'status', '--porcelain').strip():
+                fail('Текущая ветка изменилась или содержит локальные изменения', 409)
+            for name in diff['changed_files']:
+                candidate = safe_path(path, name, java=True)
+                if candidate.exists():
+                    content = candidate.read_bytes()
+                    if _private_content(content) or _embedded_credential(content) or redact(content.decode()) != content.decode():
+                        fail('В изменениях обнаружены секреты или персональные данные', 409)
+            ref = 'refs/heads/' + branch
+            def git(*args, env=None):
+                result = self.command(['git', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false',
+                                       '-C', str(path), *args], timeout=60, env=env)
+                if result['returncode'] or result.get('timed_out') or result.get('truncated'):
+                    fail('Действие Git не выполнено. Проверьте локальную identity, доступ и состояние ветки на хосте.', 409)
+                return result['output'].strip()
+            journal = meta.get('manual_git') or {}
+            if action == 'branch':
+                if journal:
+                    fail('Для исправления уже создана ветка', 409)
+                git('branch', '--', branch, meta['base_commit'])
+                journal = {'branch': branch, 'base_commit': meta['base_commit'], 'patch_sha': diff['patch_sha']}
+            else:
+                if journal.get('branch') != branch or journal.get('patch_sha') != diff['patch_sha']:
+                    fail('Сначала явно создайте ветку для этого исправления', 409)
+                if action == 'commit':
+                    if journal.get('commit'):
+                        fail('Исправление уже закоммичено', 409)
+                    if git('rev-parse', '--verify', ref) != meta['base_commit']:
+                        fail('Ветка была изменена извне', 409)
+                    message = data.get('message', '')
+                    if (not isinstance(message, str) or not 1 <= len(message.strip()) <= 200
+                            or any(ord(c) < 32 for c in message) or redact(message) != message):
+                        fail('Недопустимое сообщение коммита или обнаружен секрет')
+                    with tempfile.TemporaryDirectory(dir=self.state) as directory:
+                        env = {**os.environ, 'GIT_INDEX_FILE': str(Path(directory) / 'index'), 'GIT_TERMINAL_PROMPT': '0'}
+                        git('read-tree', meta['base_commit'], env=env)
+                        git('add', '--', *diff['changed_files'], env=env)
+                        tree = git('write-tree', env=env)
+                        commit = git('commit-tree', tree, '-p', meta['base_commit'], '-m', message, env=env)
+                    if self.diff(path, meta) != diff:
+                        fail('Исправление изменилось во время коммита', 409)
+                    git('update-ref', ref, commit, meta['base_commit'])
+                    journal['commit'] = commit
+                else:
+                    commit = journal.get('commit')
+                    if not commit or git('rev-parse', '--verify', ref) != commit:
+                        fail('Сначала создайте коммит; ветка не должна меняться извне', 409)
+                    urls = git('remote', 'get-url', '--push', '--all', 'origin').splitlines()
+                    if len(urls) != 1 or not re.fullmatch(r'(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\.git)?', urls[0]):
+                        fail('origin должен указывать на GitHub без встроенных credentials', 409)
+                    git('push', '--no-verify', '--porcelain', 'origin', commit + ':' + ref,
+                        env={**os.environ, 'GIT_TERMINAL_PROMPT': '0'})
+                    journal['pushed'] = True
+            meta['manual_git'] = journal
+            self.save(meta['workspace_id'] + '.json', meta)
+            return {'action': action, **journal}
+
 
 class DockerDeployment:
     """Fixed host operations, injectable as a group for rollback/crash tests."""
@@ -807,6 +893,11 @@ def status_route():
 @app.post('/deploy', dependencies=[Depends(authenticate)])
 def deploy_route(data: dict):
     return get_runner().deploy(data)
+
+
+@app.post('/manual-git', dependencies=[Depends(authenticate)])
+def manual_git_route(data: dict):
+    return get_runner().manual_git(data)
 
 
 def recover_deployment(*, confirmed=False, runner=None):
