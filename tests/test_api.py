@@ -56,6 +56,57 @@ def test_delete_confirmation_links_pending_work_and_id_nonreuse(controls):
     assert client.get('/incidents/1').status_code == 404
 
 
+def test_fix_upfront_deploy_authorization_must_be_explicit_and_is_persisted(controls, monkeypatch):
+    from doctor import ai
+    from doctor.db import State
+    client, factory, headers = controls
+
+    async def select_model(*args):
+        return 'verified-model'
+
+    monkeypatch.setattr(ai, 'select_model', select_model)
+    body = {'goal': 'Исправь обработку ошибок', 'auto_deploy': True}
+    assert client.post('/incidents/1/fix', headers=headers, json=body).status_code == 403
+    response = client.post('/incidents/1/fix', headers=headers, json={**body, 'confirmed': True})
+    assert response.status_code == 200
+    job_id = response.json()['id']
+    with factory() as session:
+        policy = session.get(State, f'fix-policy:{job_id}').value
+        assert policy['auto_deploy'] is True and policy['confirmed_at']
+
+
+def test_continue_can_change_goal_without_new_workspace_or_budget_and_revoke_auto_deploy(controls, monkeypatch):
+    from doctor import fixing
+    from doctor.db import State
+    client, factory, headers = controls
+    monkeypatch.setattr(fixing, 'Session', factory)
+    with factory.begin() as session:
+        session.add(FixJob(id=1, incident_id=1, status='FAILED', workspace='job-1', goal='Первый запрос'))
+        session.flush()
+        session.add(AgentRun(incident_id=1, kind='fix', calls=1))
+        session.add(State(key='fix-tools:1', value={'calls': 7}))
+    response = client.post('/fixes/1/continue', headers=headers, json={'goal': 'Исправь упавшие тесты', 'auto_deploy': True})
+    assert response.status_code == 403
+    response = client.post('/fixes/1/continue', headers=headers, json={'goal': 'Исправь упавшие тесты', 'auto_deploy': False})
+    assert response.status_code == 200 and response.json()['spent_calls'] == 1
+    with factory() as session:
+        job = session.get(FixJob, 1)
+        assert job.goal == 'Исправь упавшие тесты' and job.workspace == 'job-1'
+        assert session.get(State, 'fix-tools:1').value['calls'] == 7
+        assert session.get(State, 'fix-policy:1').value['auto_deploy'] is False
+
+
+@pytest.mark.parametrize('status', ['UNKNOWN', 'INTERRUPTED', 'ROLLBACK_FAILED'])
+def test_unverified_deployment_blocks_another_approval(controls, status):
+    from doctor.db import Deployment
+    client, factory, headers = controls
+    with factory.begin() as session:
+        session.add(FixJob(id=1, incident_id=1, status='READY', patch_sha='a' * 64))
+        session.flush()
+        session.add(Deployment(fix_job_id=1, status=status))
+    assert client.post('/fixes/1/deploy', headers=headers, json={'confirmed': True, 'patch_sha': 'a' * 64}).status_code == 409
+
+
 @pytest.mark.parametrize('active', ['diagnosis', 'fix', 'deployment', 'unknown-deployment', 'interrupted-deployment'])
 def test_delete_and_status_changes_refuse_active_work(controls, active):
     from doctor.db import Deployment

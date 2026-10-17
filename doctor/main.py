@@ -92,7 +92,7 @@ async def lifespan(app):
         for row in session.scalars(select(Incident).where(Incident.diagnosis_status == 'ANALYZING')):
             row.diagnosis_status = 'PENDING'
         for row in session.scalars(select(FixJob).where(FixJob.status.in_(['RUNNING', 'PREPARING', 'TESTING']))):
-            row.status, row.error = 'INTERRUPTED', 'API restarted; workspace preserved. Prepare a new fix to continue.'
+            row.status, row.error = 'INTERRUPTED', 'API restarted; workspace preserved. Explicitly continue this fix without resetting its budget.'
         for row in session.scalars(select(Deployment).where(Deployment.status.in_(['RUNNING', 'DEPLOYING']))):
             row.status = 'INTERRUPTED'
         for row in session.scalars(select(State).where(State.key.like('manual-git:%'))):
@@ -267,6 +267,12 @@ def require_idle(session, incident):
         raise HTTPException(409, 'Дождитесь завершения активной работы; неизвестное или прерванное состояние развёртывания/Git требует достоверной проверки на хосте')
 
 
+def require_deployment_idle(session):
+    from .fixing import BLOCKING_DEPLOYMENTS
+    if session.scalar(select(Deployment.id).where(Deployment.status.in_(BLOCKING_DEPLOYMENTS))):
+        raise HTTPException(409, 'Развёртывание ещё выполняется или его состояние требует проверки на хосте')
+
+
 def cancel_queued(session, incident):
     for job in session.scalars(select(FixJob).where(FixJob.incident_id == incident.id, FixJob.status == 'QUEUED')):
         job.status = 'ABORTED'
@@ -356,6 +362,11 @@ async def delete_incident(incident_id: int, body: ConfirmationRequest):
         if incident.status == 'EXCLUDED':
             raise HTTPException(409, 'Перед удалением верните тип ошибки из исключений')
         jobs = select(FixJob.id).where(FixJob.incident_id == incident_id)
+        for job_id in session.scalars(jobs):
+            for prefix in ('fix-policy', 'fix-tools'):
+                row = session.get(State, f'{prefix}:{job_id}')
+                if row:
+                    session.delete(row)
         next_id(session, Incident)
         next_id(session, FixJob)
         session.execute(delete(Deployment).where(Deployment.fix_job_id.in_(jobs)))
@@ -431,11 +442,15 @@ async def analyze(incident_id: int, body: AnalyzeRequest):
 
 class FixRequest(AnalyzeRequest):
     goal: str = Field(default='Prepare a minimal correct fix for this incident', min_length=1, max_length=2000)
+    auto_deploy: bool = False
+    confirmed: bool = False
 
 
 @app.post('/incidents/{incident_id}/fix')
 async def fix(incident_id: int, body: FixRequest):
     from .ai import select_model
+    if body.auto_deploy and not body.confirmed:
+        raise HTTPException(403, 'Подтвердите автоматическое развёртывание после успешных проверок')
     with Session() as session:
         if require_incident(session, incident_id).status in {'NO_ACTION', 'EXCLUDED'}:
             raise HTTPException(409, 'Сначала измените статус «Не требует решения»')
@@ -443,15 +458,18 @@ async def fix(incident_id: int, body: FixRequest):
         model = await select_model('fix', body.model)
     except Exception as exc:
         raise HTTPException(503, redact(str(exc))[:400]) from exc
-    with Session.begin() as session:
+    with incident_control_session() as session:
         incident = require_incident(session, incident_id)
         if incident.status in {'NO_ACTION', 'EXCLUDED'}:
             raise HTTPException(409, 'Сначала измените статус «Не требует решения»')
         if session.scalar(select(FixJob.id).where(FixJob.status.in_(['QUEUED', 'RUNNING', 'PREPARING', 'TESTING']))):
             raise HTTPException(409, 'Another fix is queued or running')
+        require_deployment_idle(session)
         job = FixJob(id=next_id(session, FixJob), incident_id=incident_id, model=model, goal=redact(body.goal))
         session.add(job)
         session.flush()
+        session.add(State(key=f'fix-policy:{job.id}', value={'auto_deploy': body.auto_deploy,
+                                                          'confirmed_at': now() if body.auto_deploy else None}))
         result = serialize(job)
     await bus.publish('fix', result)
     return result
@@ -459,7 +477,7 @@ async def fix(incident_id: int, body: FixRequest):
 
 @app.get('/fixes/{job_id}')
 def fix_detail(job_id: int):
-    from .fixing import job_runs
+    from .fixing import job_runs, iteration_limit, policy
     with Session() as session:
         job = session.get(FixJob, job_id)
         if not job:
@@ -468,13 +486,22 @@ def fix_detail(job_id: int):
         usage = {key: sum(getattr(run, key) for run in runs) for key in ('input_tokens', 'output_tokens', 'total_tokens', 'calls', 'latency_ms')}
         usage['approximate'] = any(run.approximate for run in runs)
         superseded = bool(session.scalar(select(FixJob.id).where(FixJob.incident_id == job.incident_id, FixJob.id > job.id).limit(1)))
-        return {**serialize(job), 'calls_used': usage['calls'], 'remaining_calls': 0 if superseded else max(0, get_settings().max_agent_iterations - usage['calls']), 'superseded': superseded, 'usage': usage}
+        return {**serialize(job), 'auto_deploy': policy(job_id, session).get('auto_deploy', False),
+                'calls_used': usage['calls'], 'remaining_calls': 0 if superseded else max(0, iteration_limit(get_settings()) - usage['calls']), 'superseded': superseded, 'usage': usage}
+
+
+class ContinueFixRequest(BaseModel):
+    goal: str | None = Field(default=None, min_length=1, max_length=2000)
+    auto_deploy: bool | None = None
+    confirmed: bool = False
 
 
 @app.post('/fixes/{job_id}/continue')
-async def continue_fix(job_id: int):
-    from .fixing import used_calls
-    with Session.begin() as session:
+async def continue_fix(job_id: int, body: ContinueFixRequest = ContinueFixRequest()):
+    from .fixing import used_calls, iteration_limit, MAX_TOOL_CALLS
+    if body.auto_deploy is True and not body.confirmed:
+        raise HTTPException(403, 'Подтвердите автоматическое развёртывание после успешных проверок')
+    with incident_control_session() as session:
         job = session.get(FixJob, job_id)
         if not job:
             raise HTTPException(404, 'Fix not found')
@@ -485,13 +512,22 @@ async def continue_fix(job_id: int):
         if session.scalar(select(FixJob.id).where(FixJob.incident_id == job.incident_id, FixJob.id > job.id).limit(1)):
             raise HTTPException(409, 'Superseded jobs cannot be continued; use the latest job without resetting its budget')
         spent = used_calls(job_id, session)
-        if spent >= get_settings().max_agent_iterations:
+        if spent >= iteration_limit(get_settings()):
             raise HTTPException(409, 'No calls remain in the original budget; no automatic budget reset')
         if session.scalar(select(FixJob.id).where(FixJob.status.in_(['QUEUED', 'RUNNING']))):
             raise HTTPException(409, 'Another fix is active')
+        tools = session.get(State, f'fix-tools:{job_id}')
+        if tools and tools.value.get('calls', 0) >= MAX_TOOL_CALLS:
+            raise HTTPException(409, 'Tool-call budget reached; continuation cannot reset it')
+        require_deployment_idle(session)
+        if body.goal is not None:
+            job.goal = redact(body.goal)
+        if body.auto_deploy is not None:
+            session.merge(State(key=f'fix-policy:{job_id}', value={'auto_deploy': body.auto_deploy,
+                                                                  'confirmed_at': now() if body.auto_deploy else None}))
         job.status, job.error = 'QUEUED', ''
     await bus.publish('fix', {'job_id': job_id})
-    return {'status': 'QUEUED', 'spent_calls': spent, 'remaining_calls': get_settings().max_agent_iterations - spent}
+    return {'status': 'QUEUED', 'id': job_id, 'spent_calls': spent, 'remaining_calls': iteration_limit(get_settings()) - spent}
 
 
 class DeployRequest(BaseModel):
@@ -559,9 +595,10 @@ def finish_manual_git(key, operation_id, status):
 
 @app.post('/fixes/{job_id}/deploy')
 async def deploy(job_id: int, body: DeployRequest):
+    from .fixing import BLOCKING_DEPLOYMENTS
     if not body.confirmed:
         raise HTTPException(403, 'Explicit approval of the displayed diff required')
-    with Session.begin() as session:
+    with incident_control_session() as session:
         job = session.get(FixJob, job_id)
         if not job:
             raise HTTPException(404, 'Fix not found')
@@ -569,9 +606,9 @@ async def deploy(job_id: int, body: DeployRequest):
             raise HTTPException(409, 'Сначала измените статус «Не требует решения»')
         if job.status != 'READY' or not job.patch_sha or not hmac.compare_digest(body.patch_sha, job.patch_sha):
             raise HTTPException(409, 'Fix is not ready or diff changed')
-        if session.scalar(select(Deployment.id).where(Deployment.status.in_(['QUEUED', 'RUNNING', 'DEPLOYING']))):
+        if session.scalar(select(Deployment.id).where(Deployment.status.in_(BLOCKING_DEPLOYMENTS))):
             raise HTTPException(409, 'Deployment already active')
-        deployment = Deployment(fix_job_id=job_id)
+        deployment = Deployment(fix_job_id=job_id, result={'authorization': 'exact_hash', 'patch_sha': body.patch_sha})
         session.add(deployment)
         session.flush()
         result = serialize(deployment)
@@ -646,7 +683,7 @@ class SettingsUpdate(BaseModel):
     diagnosis_cooldown_seconds: int | None = Field(None, ge=60, le=86400)
     max_context_tokens: int | None = Field(None, ge=1000, le=24000)
     max_output_tokens: int | None = Field(None, ge=256, le=8000)
-    max_agent_iterations: int | None = Field(None, ge=1, le=6)
+    max_agent_iterations: int | None = Field(None, ge=1, le=30)
 
 
 @app.patch('/settings')

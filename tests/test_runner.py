@@ -451,6 +451,63 @@ def test_subprocess_output_and_deadline_are_bounded():
     assert result['timed_out'] and result['returncode'] != 0
 
 
+def test_subprocess_preserves_final_failure_after_large_startup_output():
+    result = run_command([sys.executable, '-c', 'print("startup\\n" + "x" * 1000000 + "\\n[ERROR] final assertion failed")'])
+    assert result['truncated'] and len(result['output']) == module.OUTPUT_LIMIT
+    assert result['output'].startswith('startup\n')
+    assert result['output'].endswith('[ERROR] final assertion failed\n')
+
+
+def test_file_list_discovers_paths_without_broad_content_search(harness):
+    h = harness
+    ws = workspace(h)
+    result = h.runner.tool({'workspace_id': ws, 'action': 'file_list', 'path': 'src/main/java'})
+    assert result == {'files': [JAVA], 'truncated': False}
+    for path in ('../', '.env', '.git', ''):
+        with pytest.raises(HTTPException):
+            h.runner.tool({'workspace_id': ws, 'action': 'file_list', 'path': path})
+
+
+def test_surefire_reports_keep_root_cause_and_do_not_follow_symlinks(tmp_path):
+    reports = tmp_path / 'target/surefire-reports'
+    reports.mkdir(parents=True)
+    report = reports / 'TEST-Example.xml'
+    report.write_text('''<testsuite><testcase classname="ExampleTest" name="handlesError">
+      <error type="java.lang.IllegalStateException" message="Failed to load ApplicationContext">
+java.lang.IllegalStateException: Failed to load ApplicationContext
+at example.Frame.method(Frame.java:1)
+Caused by: NoSuchBeanDefinitionException: No qualifying bean PasswordEncoder
+      </error></testcase></testsuite>''')
+    failures = Runner.test_failures(tmp_path)
+    assert len(failures) == 1 and failures[0]['test'] == 'ExampleTest.handlesError'
+    assert 'PasswordEncoder' in failures[0]['causes'][0]
+    outside = tmp_path / 'outside.xml'
+    report.rename(outside)
+    report.symlink_to(outside)
+    assert Runner.test_failures(tmp_path) == []
+
+
+def test_agent_failure_feedback_includes_spring_root_cause_before_maven_summary():
+    from doctor.fixing import _test_feedback
+    output = ('[ERROR] Failed to load ApplicationContext\n'
+              'Caused by: NoSuchBeanDefinitionException: No qualifying bean PasswordEncoder\n' +
+              'at expected.Test.method(Test.java:1)\n' * 400 + '[ERROR] BUILD FAILURE')
+    feedback = _test_feedback({'passed': False, 'output': output})
+    assert 'No qualifying bean PasswordEncoder' in feedback['output']
+    assert 'BUILD FAILURE' in feedback['output']
+
+
+def test_context_compaction_preserves_the_entire_user_goal():
+    from doctor.fixing import _fit_messages
+    goal = 'Исправь ошибку. ' * 60 + 'Обязательно сохрани статус 404 и не ослабляй безопасность.'
+    settings = SimpleNamespace(max_context_tokens=5000, max_output_tokens=500)
+    initial = [{'role': 'system', 'content': 'Respect the supplied goal.'},
+               {'role': 'user', 'content': json.dumps({'goal': goal, 'evidence': 'x' * 20000}, ensure_ascii=False)}]
+    messages = _fit_messages(initial, [[{'role': 'user', 'content': 'logs' * 5000}]], [], settings)
+    assert goal in messages[1]['content']
+    assert len(json.dumps({'messages': messages, 'tools': []}, ensure_ascii=False).encode()) + 16 * len(messages) < 4500
+
+
 def test_crash_journal_recovers_previous_image_without_startup_restart(harness):
     h = harness
     h.runner.save('deployment.json', {'status': 'VERIFYING', 'previous_image': h.ops.old,
@@ -485,6 +542,24 @@ def test_deployed_fingerprint_matches_even_when_image_version_changes(harness):
     ops = DockerDeployment(harness.runner)
     assert ops.fingerprint_seen(logs, metadata, '2026-01-01T00:00:00Z', 'new-container')
     assert not ops.fingerprint_seen(logs.replace('incorrect value', 'another problem'), metadata, '', 'new')
+
+
+@pytest.mark.parametrize('exception', ['Exception', 'java.lang.NullPointerException', 'NullPointerException'])
+def test_deploy_exception_check_ignores_info_and_classname_substrings(exception):
+    logs = ('INFO DefaultSecurityFilterChain: Will secure any request with [org.springframework.security.web.access.ExceptionTranslationFilter@123]\n'
+            'INFO ExceptionHandlerExceptionResolver: ControllerAdvice beans\n'
+            'ERROR SomeFactory: NullPointerExceptionFactory is not a throwable\n')
+    assert not DockerDeployment.exception_seen(logs, exception)
+
+
+@pytest.mark.parametrize('logs,exception', [
+    ('ERROR TemplateEngine: Exception processing template "error"', 'Exception'),
+    ('java.lang.NullPointerException: value is null\n\tat example.Foo.bar(Foo.java:1)', 'NullPointerException'),
+    ('Caused by: java.lang.NullPointerException: value is null', 'java.lang.NullPointerException'),
+    ('ERROR failure: java.lang.IllegalArgumentException: invalid', 'IllegalArgumentException'),
+])
+def test_deploy_exception_check_still_detects_actual_errors(logs, exception):
+    assert DockerDeployment.exception_seen(logs, exception)
 
 
 @pytest.mark.asyncio
@@ -557,7 +632,7 @@ async def test_model_success_claim_cannot_bypass_final_tests_or_diff(fixing_harn
 
     monkeypatch.setattr(h.fixing, 'llm_call', llm)
     result = await h.fixing.prepare_fix(h.job_id)
-    assert result['status'] == 'FAILED'
+    assert result['status'] == 'BUDGET_EXHAUSTED'
     assert not result['patch']
     assert any(p.get('action') == 'run_allowed_tests' for op, p in h.operations if op == 'tool')
     assert not any(op == 'deploy' for op, _ in h.operations)
@@ -587,13 +662,14 @@ async def test_agent_ready_only_after_fixed_validation_no_reasoning_events(fixin
     assert 'PRIVATE CHAIN OF THOUGHT' not in json.dumps(result['events'])
     assert not h.runner.ops.activated
     again = await h.fixing.prepare_fix(h.job_id)
-    assert again['status'] == 'READY' and count == 2
+    assert again['status'] == 'READY' and count == 1  # No redundant LLM summary call.
 
 
 @pytest.mark.asyncio
 async def test_agent_iterations_are_capped_and_partial_patch_retained(fixing_harness, monkeypatch):
     h = fixing_harness
     h.settings.max_agent_iterations = 999
+    h.runner.test_result.update(returncode=1, output='[ERROR] assertion failed')
     count = 0
 
     async def llm(*args, **kwargs):
@@ -607,9 +683,9 @@ async def test_agent_iterations_are_capped_and_partial_patch_retained(fixing_har
 
     monkeypatch.setattr(h.fixing, 'llm_call', llm)
     result = await h.fixing.prepare_fix(h.job_id)
-    assert count == 6
+    assert count == h.fixing.MAX_ITERATIONS
     assert result['patch'] and 'iteration limit' in result['summary']
-    assert result['tests']['passed']
+    assert not result['tests']['passed']
 
 
 @pytest.mark.asyncio
@@ -653,12 +729,12 @@ async def test_agent_cannot_inject_deploy_or_workspace_parameters(fixing_harness
 
 
 @pytest.mark.asyncio
-async def test_agent_refuses_batch_exceeding_twenty_tool_calls(fixing_harness, monkeypatch):
+async def test_agent_refuses_batch_exceeding_tool_budget(fixing_harness, monkeypatch):
     h = fixing_harness
 
     async def llm(*args, **kwargs):
         return {'choices': [{'message': {'tool_calls': [
-            {'id': str(i), 'function': {'name': 'git_status', 'arguments': '{}'}} for i in range(21)
+            {'id': str(i), 'function': {'name': 'git_status', 'arguments': '{}'}} for i in range(h.fixing.MAX_TOOL_CALLS + 1)
         ]}}]}
 
     monkeypatch.setattr(h.fixing, 'llm_call', llm)
@@ -687,3 +763,136 @@ async def test_deployment_orchestrator_requires_ready_job_and_uses_exact_hash(fi
     assert result['status'] == 'SUCCEEDED'
     request = [payload for operation, payload in h.operations if operation == 'deploy'][0]
     assert request == {'workspace_id': job['workspace'], 'patch_sha': job['patch_sha'], 'confirmed': True}
+
+
+def tool_response(name, arguments=None, call_id='call'):
+    return {'choices': [{'message': {'tool_calls': [{'id': call_id, 'type': 'function', 'function': {
+        'name': name, 'arguments': json.dumps(arguments or {})}}]}}]}
+
+
+@pytest.mark.asyncio
+async def test_json_patch_tests_fail_then_agent_reads_and_repairs_in_same_workspace(fixing_harness, monkeypatch):
+    h = fixing_harness
+    h.settings.max_agent_iterations = 7
+    h.runner.test_result.update(returncode=1, output='[ERROR] package jakarta.servlet does not exist\nBUILD FAILURE')
+    calls = 0
+
+    async def llm(messages, model, incident_id, kind, tools=None):
+        nonlocal calls
+        calls += 1
+        if calls <= 2:
+            return tool_response('file_read', {'path': JAVA}, str(calls))
+        if calls == 3:
+            assert kind == 'fix_patch' and tools is None
+            return {'choices': [{'message': {'content': json.dumps({'summary': 'Первый patch',
+                'changes': [{'path': JAVA, 'old': '"bad"', 'new': '"broken"'}]})}}]}
+        assert 'package jakarta.servlet does not exist' in json.dumps(messages)
+        assert {'file_read', 'file_search', 'file_apply_patch', 'run_allowed_tests'} <= {t['function']['name'] for t in tools}
+        if calls == 4:
+            return tool_response('file_read', {'path': JAVA}, str(calls))
+        assert calls == 5
+        h.runner.test_result.update(returncode=0, output='Tests passed')
+        return tool_response('file_apply_patch', {'path': JAVA, 'replacements': [{'old': '"broken"', 'new': '"good"'}]})
+
+    monkeypatch.setattr(h.fixing, 'llm_call', llm)
+    result = await h.fixing.prepare_fix(h.job_id)
+    assert result['status'] == 'READY' and calls == 5
+    assert result['tests']['passed'] and result['tests']['patch_sha'] == result['patch_sha']
+    validations = [e for e in result['events'] if e['kind'] == 'validation']
+    assert [e['data']['tests']['passed'] for e in validations] == [False, True]
+    assert not h.runner.ops.activated
+
+
+@pytest.mark.asyncio
+async def test_continuation_gets_retained_patch_and_failure_and_preserves_budget(fixing_harness, monkeypatch):
+    from doctor.db import AgentRun, FixJob
+    h = fixing_harness
+    ws = workspace(h.runner)
+    edit(h.runner, ws)
+    h.runner.test_result.update(returncode=1, output='[ERROR] expected: <good> but was: <bad>')
+    tests = h.runner.runner.tool({'workspace_id': ws, 'action': 'run_allowed_tests'})
+    with h.sessions.begin() as session:
+        job = session.get(FixJob, h.job_id)
+        job.tests = tests
+        session.add(AgentRun(incident_id=job.incident_id, kind='fix', calls=1))
+
+    async def llm(messages, *args, **kwargs):
+        content = json.dumps(messages)
+        assert 'retained_workspace' in content and 'expected:' in content and 'good' in content
+        h.runner.test_result.update(returncode=0, output='Passed')
+        return tool_response('file_apply_patch', {'path': JAVA, 'replacements': [{'old': '"good"', 'new': '"better"'}]})
+
+    monkeypatch.setattr(h.fixing, 'llm_call', llm)
+    result = await h.fixing.prepare_fix(h.job_id)
+    assert result['status'] == 'READY' and 'better' in result['patch']
+    with h.sessions() as session:
+        assert h.fixing.used_calls(h.job_id, session) == 1  # Mock LLM does not create extra AgentRuns.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('passed', [False, True])
+async def test_upfront_authorized_deploy_queued_only_for_trusted_passing_patch(fixing_harness, monkeypatch, passed):
+    from doctor.db import Deployment, State
+    h = fixing_harness
+    with h.sessions.begin() as session:
+        session.add(State(key=f'fix-policy:{h.job_id}', value={'auto_deploy': True, 'confirmed_at': 'explicit'}))
+    h.runner.test_result.update(returncode=0 if passed else 1, output='Test result')
+
+    async def llm(*args, **kwargs):
+        if not h.runner.runner.load('job-1.json') or not (h.runner.runner.root / 'job-1' / JAVA).read_text().count('"good"'):
+            return tool_response('file_apply_patch', {'path': JAVA, 'replacements': [{'old': '"bad"', 'new': '"good"'}]})
+        return tool_response('git_status')
+
+    monkeypatch.setattr(h.fixing, 'llm_call', llm)
+    job = await h.fixing.prepare_fix(h.job_id)
+    with h.sessions() as session:
+        deployments = session.query(Deployment).all()
+        assert len(deployments) == int(passed)
+        deploy_id = deployments[0].id if deployments else None
+    assert not h.runner.ops.activated
+    if passed:
+        result = await h.fixing.deploy_fix(deploy_id)
+        assert result['status'] == 'SUCCEEDED'
+        assert h.runner.ops.activated == [h.runner.ops.new]
+        assert job['tests']['patch_sha'] == job['patch_sha']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('status', ['UNKNOWN', 'HTTP500', 'HTTP409', 'ROLLBACK_FAILED', 'ROLLED_BACK', 'ABORTED'])
+async def test_auto_deploy_retries_only_confirmed_failure_or_healthy_rollback(fixing_harness, monkeypatch, status):
+    from doctor.db import Deployment, FixJob, State
+    h = fixing_harness
+    with h.sessions.begin() as session:
+        job = session.get(FixJob, h.job_id)
+        job.status, job.workspace, job.patch_sha = 'READY', 'job-1', 'a' * 64
+        session.add(State(key=f'fix-policy:{job.id}', value={'auto_deploy': True}))
+        deployment = Deployment(fix_job_id=job.id)
+        session.add(deployment)
+        session.flush()
+        deploy_id = deployment.id
+
+    async def call(*args, **kwargs):
+        if status == 'UNKNOWN':
+            raise httpx.ReadTimeout('secret-network-body')
+        if status in {'HTTP500', 'HTTP409'}:
+            response = httpx.Response(int(status[4:]), request=httpx.Request('POST', 'http://runner/deploy'))
+            response.raise_for_status()
+        return {'status': status, 'patch_sha': 'a' * 64, 'error': 'Build/verification failure'}
+
+    monkeypatch.setattr(h.fixing, 'runner_call', call)
+    result = await h.fixing.deploy_fix(deploy_id)
+    assert result['status'] == ({'HTTP500': 'UNKNOWN', 'HTTP409': 'FAILED'}.get(status, status))
+    with h.sessions() as session:
+        assert session.get(FixJob, h.job_id).status == ('QUEUED' if status in {'ROLLED_BACK', 'ABORTED'} else 'FAILED')
+    assert 'secret-network-body' not in json.dumps(result)
+
+
+def test_runner_validation_errors_are_actionable_but_arbitrary_bodies_are_not():
+    from doctor.fixing import _error
+    for detail, expected in [('Each old text must match exactly once', 'Each old text'),
+                             ('File already exists', 'File already exists'),
+                             ('password=super-secret Authorization: private', 'Runner HTTP 409')]:
+        response = httpx.Response(409, json={'detail': detail}, request=httpx.Request('POST', 'http://runner/tool'))
+        error = httpx.HTTPStatusError('never expose this', request=response.request, response=response)
+        result = _error(error)
+        assert expected in result and 'super-secret' not in result and 'private' not in result

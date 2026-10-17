@@ -11,7 +11,7 @@ class Settings(BaseSettings):
     default_fix_model: str = ''
     max_context_tokens: int = 18000
     max_output_tokens: int = 3000
-    max_agent_iterations: int = 5
+    max_agent_iterations: int = 12
     max_llm_concurrency: int = 1
     max_diagnosis_queue: int = 100
     diagnosis_cooldown_seconds: int = 900

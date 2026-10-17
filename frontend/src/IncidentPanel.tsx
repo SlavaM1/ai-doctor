@@ -61,7 +61,7 @@ function FixBudget({ job, refresh, onError }: { job: FixJob; refresh: () => void
   return <div className="test-results">
     {job.usage && <p className="small muted">Использовано вызовов: {number(job.calls_used)}; осталось: {number(job.remaining_calls)}. Токенов на входе: {number(job.usage.input_tokens)} / на выходе: {number(job.usage.output_tokens)}{job.usage.approximate ? ' (приблизительно)' : ''}. {number(job.usage.latency_ms)} мс.</p>}
     {canContinue && <button className="button" disabled={busy} onClick={resume}>{busy ? 'Отправка запроса…' : 'Продолжить в пределах лимита'}</button>}
-    {canContinue && <p className="small muted">Явное продолжение сохраняет рабочую область и исходный счётчик вызовов. Оно не сбрасывает лимит и не одобряет развёртывание.</p>}
+    {canContinue && <p className="small muted">Продолжение сохраняет рабочую область и счётчик вызовов. {job.auto_deploy ? 'Ранее разрешённый автодеплой остаётся включён.' : 'Автодеплой не разрешён.'}</p>}
   </div>
 }
 
@@ -94,6 +94,7 @@ function FixReview({ job, refresh, onError, stale }: { job: FixJob; refresh: () 
   return <div className="fix-review">
     <div className="fix-heading"><div><strong>Исправление #{job.id}</strong><span className="muted">{date(job.created_at)}</span></div><Badge tone={statusTone(job.status)}>{label(job.status)}</Badge></div>
     {job.goal && <p className="fix-goal">{job.goal}</p>}
+    {job.auto_deploy && <p className="small muted">Разрешён автоматический цикл: исправление → тесты → развёртывание. При неудаче — откат; продолжение только в пределах лимита.</p>}
     {job.summary && <p className="prose">{job.summary}</p>}
     {job.error && <ErrorNotice>{job.error}</ErrorNotice>}
     <FixBudget job={job} refresh={refresh} onError={onError} />
@@ -127,6 +128,8 @@ export default function IncidentPanel({ id, revision, refresh, models, settings 
   const [diagnosisModel, setDiagnosisModel] = useState('')
   const [fixModel, setFixModel] = useState('')
   const [goal, setGoal] = useState('')
+  const [autoDeploy, setAutoDeploy] = useState(false)
+  const [confirmAuto, setConfirmAuto] = useState(false)
   const [intent, setIntent] = useState<'explain' | 'fix'>('explain')
   const [busy, setBusy] = useState('')
   const [error, setError] = useState('')
@@ -139,16 +142,20 @@ export default function IncidentPanel({ id, revision, refresh, models, settings 
   const fix = useApi<FixJob>(fixId != null ? `/fixes/${fixId}` : null, revision)
   const currentFix = fix.data || fixes.find(job => job.id === fixId)
 
-  const action = async (kind: 'analyze' | 'explain' | 'fix') => {
+  const resumable = currentFix && currentFix.id === fixes[0]?.id && ['FAILED', 'BUDGET_EXHAUSTED', 'INTERRUPTED'].includes(currentFix.status) && (currentFix.remaining_calls ?? 0) > 0
+  const action = async (kind: 'analyze' | 'explain' | 'fix', confirmed = false) => {
     if (busy || (kind !== 'analyze' && !goal.trim())) return
+    if (kind === 'fix' && autoDeploy && !confirmed) { setConfirmAuto(true); return }
+    setConfirmAuto(false)
     setBusy(kind); setError(''); setFeedback('')
     setLastAction(kind)
     try {
-      const response = await mutate<unknown>(`/incidents/${id}/${kind === 'explain' ? 'chat' : kind}`, kind === 'analyze' ? { model: diagnosisModel } : kind === 'fix' ? { goal: goal.trim(), model: fixModel } : { message: goal.trim(), model: diagnosisModel })
+      const path = kind === 'fix' && resumable ? `/fixes/${currentFix.id}/continue` : `/incidents/${id}/${kind === 'explain' ? 'chat' : kind}`
+      const response = await mutate<unknown>(path, kind === 'analyze' ? { model: diagnosisModel } : kind === 'fix' ? { goal: goal.trim(), model: fixModel, auto_deploy: autoDeploy, confirmed } : { message: goal.trim(), model: diagnosisModel })
       if (kind === 'explain') { setChatResponse(response); setFeedback('Ответ получен.') }
       if (kind === 'analyze') setFeedback('Анализ запрошен. Результаты появятся, когда сервер их передаст.')
       if (kind === 'fix') {
-        setFeedback('Подготовка исправления запрошена. Без одобрения ничего не будет развёрнуто.')
+        setFeedback(autoDeploy ? 'Запущен цикл исправления с тестами и автоматическим развёртыванием в пределах лимита.' : resumable ? 'Продолжено исправление в прежней рабочей области. Автодеплой выключен.' : 'Подготовка исправления запрошена. Без одобрения ничего не будет развёрнуто.')
         if (response && typeof response === 'object') {
           const data = response as JsonObject
           const job = data.fix_job && typeof data.fix_job === 'object' ? data.fix_job as JsonObject : data
@@ -197,10 +204,15 @@ export default function IncidentPanel({ id, revision, refresh, models, settings 
       {sortedDiagnoses.length > 1 && <details className="result-details"><summary>Предыдущие диагностики ({sortedDiagnoses.length - 1})</summary>{sortedDiagnoses.slice(1).map(diagnosis => <DiagnosisResult key={diagnosis.id} diagnosis={diagnosis} />)}</details>}
     </section>
 
-    {!excluded && <section className="work-section fix-section"><div className="section-heading"><h3><Icon name="chat" />Исследование и исправление</h3><span className="small muted">Нужно одобрение человека</span></div>
+    {!excluded && <section className="work-section fix-section"><div className="section-heading"><h3><Icon name="chat" />Исследование и исправление</h3><span className="small muted">Тесты обязательны</span></div>
       <div className="chat-log">{chat.map((entry, index) => <ChatEntry key={index} entry={entry} />)}{chatResponse !== undefined && <div className="latest-response"><span className="field-label">Ответ на последнее действие</span><ChatEntry entry={chatResponse} /></div>}</div>
       <form className="composer" onSubmit={event => { event.preventDefault(); action(intent) }}><div className="intent-switch" role="group" aria-label="Тип действия"><button type="button" aria-pressed={intent === 'explain'} className={intent === 'explain' ? 'selected' : ''} onClick={() => setIntent('explain')}>Спросить / объяснить</button><button type="button" aria-pressed={intent === 'fix'} className={intent === 'fix' ? 'selected' : ''} onClick={() => setIntent('fix')}>Подготовить исправление</button></div><label className="sr-only" htmlFor={`goal-${id}`}>{intent === 'fix' ? 'Цель исправления' : 'Вопрос об инциденте'}</label><textarea id={`goal-${id}`} value={goal} onChange={event => setGoal(event.target.value)} placeholder={intent === 'fix' ? 'Опишите изменения, которые должен подготовить агент…' : 'Спросите о данных, диагностике или более безопасном подходе…'} rows={3} required maxLength={2000} /><div className="composer-footer"><ModelSelect value={intent === 'fix' ? fixModel : diagnosisModel} onChange={intent === 'fix' ? setFixModel : setDiagnosisModel} models={models} configured={intent === 'fix' ? settings?.default_fix_model : settings?.default_diagnosis_model} /><button className="button primary" type="submit" disabled={!!busy || !goal.trim()}>{busy === 'explain' || busy === 'fix' ? 'Отправка запроса…' : intent === 'fix' ? 'Подготовить исправление' : 'Отправить вопрос'}<Icon name="arrow" size={16} /></button></div></form>
-      <p className="composer-note">{intent === 'fix' ? 'Создаёт изолированный вариант изменений. Перед развёртыванием проверьте изменения и тесты.' : 'Отправляет вопрос на сервер. Полученная диагностика или результат действия появятся здесь.'}</p>
+      {intent === 'fix' && <label className="acknowledgement"><input type="checkbox" checked={autoDeploy} onChange={event => setAutoDeploy(event.target.checked)} />Исправить и автоматически развернуть после успешных проверок</label>}
+      <p className="composer-note">{intent === 'fix' ? `${resumable ? 'Будет продолжено последнее исправление: patch и счётчик вызовов сохранятся. ' : 'Создаёт изолированный вариант изменений. '}Агент повторяет правки и тесты до успеха или исчерпания лимита. ${autoDeploy ? 'Развёртывание изменит целевое приложение; при сбое выполняется откат.' : 'Развёртывание требует отдельного одобрения.'}` : 'Отправляет вопрос на сервер. Полученная диагностика или результат действия появятся здесь.'}</p>
+      {confirmAuto && <ConfirmDialog title="Исправить и развернуть автоматически?" onClose={() => setConfirmAuto(false)}>
+        <p>Вы разрешаете агенту менять Java-код и тесты для INC-{id}, повторять проверки и развернуть проверенный patch без отдельного одобрения его хеша. Это изменит целевое приложение. Ошибки сборки и проверенный откат возвращаются агенту; неизвестное состояние или сбой отката останавливают работу. Лимит вызовов не сбрасывается.</p>
+        <p className="prose">{goal}</p><div className="dialog-actions"><button className="button" onClick={() => setConfirmAuto(false)}>Отмена</button><button className="button primary" onClick={() => action('fix', true)}>Разрешить исправление и деплой</button></div>
+      </ConfirmDialog>}
       {lastAction !== 'analyze' && error && <ErrorNotice>{error}</ErrorNotice>}{lastAction !== 'analyze' && feedback && <p className="feedback" role="status">{feedback}</p>}
       {fixes.length > 1 && <label className="fix-selector">История исправлений<select value={fixId} onChange={event => setChosenFix(Number(event.target.value))}>{fixes.map(job => <option key={job.id} value={job.id}>#{job.id} — {label(job.status)} — {date(job.created_at)}</option>)}</select></label>}
       {fix.error && <ErrorNotice>{fix.error}</ErrorNotice>}

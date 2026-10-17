@@ -19,6 +19,7 @@ import tempfile
 import threading
 import time
 import uuid
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 
 import httpx
@@ -49,6 +50,9 @@ def run_command(argv, *, cwd=None, timeout=60, output_limit=OUTPUT_LIMIT, env=No
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                start_new_session=True)
     output = bytearray()
+    truncated = False
+    marker = b'\n... output truncated; final diagnostics follow ...\n'
+    head_size = output_limit // 4
     deadline = time.monotonic() + timeout
     timed_out = False
     with selectors.DefaultSelector() as selector:
@@ -62,8 +66,13 @@ def run_command(argv, *, cwd=None, timeout=60, output_limit=OUTPUT_LIMIT, env=No
                 chunk = os.read(key.fileobj.fileno(), 65536)
                 if not chunk:
                     selector.unregister(key.fileobj)
-                elif len(output) < output_limit:
-                    output.extend(chunk[:output_limit - len(output)])
+                else:
+                    output.extend(chunk)
+                    if len(output) > output_limit:
+                        # Maven's failures and assertion summary are at the END.
+                        # Drain all output, retaining a bounded head and tail.
+                        truncated = True
+                        del output[head_size:len(output) - (output_limit - head_size)]
     # A child may close stdout before exiting: the same deadline still applies.
     try:
         process.wait(timeout=max(.01, deadline - time.monotonic()))
@@ -72,8 +81,10 @@ def run_command(argv, *, cwd=None, timeout=60, output_limit=OUTPUT_LIMIT, env=No
         os.killpg(process.pid, signal.SIGKILL)
         process.wait()
     process.stdout.close()
+    if truncated and output_limit > len(marker):
+        output[head_size:head_size + len(marker)] = marker
     return {'returncode': process.returncode, 'output': output.decode('utf-8', 'replace'),
-            'timed_out': timed_out, 'truncated': len(output) >= output_limit}
+            'timed_out': timed_out, 'truncated': truncated}
 
 
 def _secret_path(path):
@@ -309,6 +320,16 @@ class Runner:
                         return {'matches': matches, 'truncated': True}
         return {'matches': matches, 'truncated': False}
 
+    def list_files(self, root, data):
+        """Filename discovery only: no broad content scan or secret filenames."""
+        scope = data.get('path', '')
+        safe_path(root, scope)
+        if not scope.startswith('src/') and scope not in {'src', 'pom.xml'}:
+            fail('Forbidden filename')
+        files = [name for name in self.source_files(root)
+                 if name == scope or name.startswith(scope.rstrip('/') + '/')]
+        return {'files': files[:120], 'truncated': len(files) > 120}
+
     def workspace(self, data):
         job_id = str(data.get('job_id', ''))
         if not re.fullmatch('[1-9][0-9]{0,17}', job_id):
@@ -422,6 +443,7 @@ class Runner:
                     '--memory', '1g', '--cpus', '1', '--pids-limit', '256', '--cap-drop', 'ALL',
                     '--security-opt', 'no-new-privileges', '--read-only',
                     '--user', f'{os.getuid()}:{os.getgid()}', '--env', 'MAVEN_CONFIG=/tmp/m2',
+                    '--env', 'MAVEN_OPTS=-Djansi.mode=strip -Djansi.passthrough=true',
                     '--tmpfs', '/tmp:rw,nosuid,size=768m',
                     '--mount', f'type=bind,src={snapshot},dst=/workspace', '--workdir', '/workspace',
                     'maven:3.9-eclipse-temurin-17', 'mvn', '-B', '-ntp', '-Dmaven.repo.local=/tmp/m2/repository',
@@ -431,20 +453,57 @@ class Runner:
             finally:
                 # Killing the docker client does not stop its container.
                 self.command(['docker', 'rm', '-f', name], timeout=20)
+            failures = self.test_failures(snapshot)
         after = self.diff(path, meta)
         tests = {'passed': result['returncode'] == 0 and not result.get('timed_out') and before == after,
                  'patch_sha': before['patch_sha'], 'base_commit': meta['base_commit'],
-                  'output': redact(bounded(result['output'])), 'timed_out': result.get('timed_out', False)}
+                   'output': redact(bounded(result['output'])), 'timed_out': result.get('timed_out', False)}
+        tests['failures'] = failures
         tests['selected_tests'] = sorted(selected)
         tests['java_version'] = 17
         meta['tests'] = tests
         self.save(meta['workspace_id'] + '.json', meta)
         return tests
 
+    @staticmethod
+    def test_failures(snapshot):
+        """Capture JUnit causes before deleting the sandbox. Console head/tail
+        alone can lose the actual cause among expected test stack traces.
+        Report files are untrusted, bounded, never followed through symlinks.
+        """
+        reports = snapshot / 'target' / 'surefire-reports'
+        if reports.is_symlink() or (snapshot / 'target').is_symlink():
+            return []
+        failures, size = [], 0
+        for report in sorted(reports.glob('TEST-*.xml'))[:40]:
+            if report.is_symlink() or not report.is_file() or report.stat().st_size > FILE_LIMIT:
+                continue
+            try:
+                raw = report.read_bytes()
+                if b'<!DOCTYPE' in raw.upper() or b'<!ENTITY' in raw.upper():
+                    continue
+                root = ET.fromstring(raw)
+            except (ET.ParseError, OSError):
+                continue
+            for case in root.iter('testcase'):
+                for failure in [*case.findall('failure'), *case.findall('error')]:
+                    detail = failure.text or ''
+                    causes = [line.strip()[:800] for line in detail.splitlines() if 'Caused by:' in line][-3:]
+                    item = redact_data({'test': case.get('classname', '') + '.' + case.get('name', ''),
+                                        'type': failure.get('type', ''), 'message': failure.get('message', '')[:1400],
+                                        'causes': causes})
+                    size += len(json.dumps(item))
+                    if len(failures) >= 8 or size > 8000:
+                        return failures
+                    failures.append(item)
+        return failures
+
     def tool(self, data):
         with self.locked():
             path, meta = self.workspace_meta(data.get('workspace_id'))
             action = data.get('action')
+            if action == 'file_list':
+                return self.list_files(path, data)
             if action == 'file_search':
                 files = [name for name in self.source_files(path) if name.startswith('src/') or name == 'pom.xml']
                 return self.search(path, files, data)
@@ -823,10 +882,27 @@ class DockerDeployment:
                 raise RuntimeError('Cannot verify bounded post-deployment logs')
             logs = log_result['output']
             exception = metadata.get('exception_type')
-            result['original_exception_seen'] = bool(exception and exception in logs)
+            result['original_exception_seen'] = self.exception_seen(logs, exception)
             result['original_fingerprint_seen'] = self.fingerprint_seen(logs, metadata, since, container['container_id'])
             result['ok'] = result['ok'] and not (result['original_exception_seen'] or result['original_fingerprint_seen'])
         return result
+
+    @staticmethod
+    def exception_seen(logs, exception):
+        """Match actual exception tokens, not INFO class names such as
+        ExceptionTranslationFilter, ExceptionHandler or FooExceptionFactory.
+        Generic detector fallback 'Exception' must not reject every Spring boot.
+        """
+        if not isinstance(exception, str) or not exception:
+            return False
+        prefix = r'(?:[\w$]+\.)*' if '.' not in exception else ''
+        token = re.compile(r'(?<![\w.$])' + prefix + re.escape(exception) + r'(?=[:\s]|$)')
+        for line in logs.splitlines():
+            if (re.search(r'\b(?:ERROR|FATAL)\b', line) or
+                    re.match(r'\s*(?:Caused by:\s*|Suppressed:\s*)?(?:[\w$]+\.)*[\w$]*(?:Exception|Error)\b', line)):
+                if token.search(line):
+                    return True
+        return False
 
     def fingerprint_seen(self, logs, metadata, since, container_id):
         expected = metadata.get('fingerprint')
