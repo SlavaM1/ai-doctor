@@ -5,6 +5,7 @@ import uuid
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Literal
+import httpx
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -424,6 +425,11 @@ async def manual_git(job_id: int, body: ManualGitRequest):
                                                'job_id': job_id, 'action': body.action, 'started_at': now()}))
         try:
             result = await runner_call('manual-git', {**body.model_dump(), 'workspace_id': workspace}, timeout=90)
+        except httpx.HTTPStatusError as exc:
+            # A direct runner response confirms that its handler has finished.
+            # Validation/Git failures must not permanently lock incident controls.
+            finish_manual_git(key, operation_id, 'FAILED')
+            raise HTTPException(409, 'Git завершился с ошибкой. Проверьте ветку, актуальность исправления, identity и доступ GitHub на хосте; затем повторите действие.') from exc
         except (Exception, asyncio.CancelledError) as exc:
             finish_manual_git(key, operation_id, 'UNKNOWN')
             if isinstance(exc, asyncio.CancelledError):

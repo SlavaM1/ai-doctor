@@ -174,6 +174,29 @@ def test_git_timeout_and_restart_do_not_release_durable_guard(controls, monkeypa
         assert len(calls) == 1
 
 
+def test_confirmed_runner_git_error_allows_retry_and_incident_controls(controls, monkeypatch):
+    from doctor.db import State
+    client, factory, headers = controls
+    with factory.begin() as session:
+        session.add(FixJob(id=1, incident_id=1, status='READY', patch_sha='a' * 64, workspace='job-1'))
+    async def rejected(*args, **kwargs):
+        request = httpx.Request('POST', 'http://runner/manual-git')
+        response = httpx.Response(409, request=request, text='Sensitive host detail')
+        raise httpx.HTTPStatusError('Sensitive host detail', request=request, response=response)
+    monkeypatch.setattr(main, 'runner_call', rejected)
+    body = {'confirmed': True, 'patch_sha': 'a' * 64, 'action': 'branch', 'branch': 'doctor/test'}
+    result = client.post('/fixes/1/git', headers=headers, json=body)
+    assert result.status_code == 409 and 'Sensitive' not in result.text
+    with factory() as session:
+        assert session.get(State, 'manual-git:1').value['status'] == 'FAILED'
+    assert client.patch('/incidents/1/status', headers=headers, json={'status': 'OPEN'}).status_code == 200
+    async def completed(*args, **kwargs):
+        return {'branch': 'doctor/test'}
+    monkeypatch.setattr(main, 'runner_call', completed)
+    assert client.post('/fixes/1/git', headers=headers, json=body).status_code == 200
+    assert client.request('DELETE', '/incidents/1', headers=headers, json={'confirmed': True}).status_code == 200
+
+
 def test_restart_preserves_unacknowledged_running_git_admission(controls, monkeypatch):
     from doctor.db import State
     _, factory, headers = controls
