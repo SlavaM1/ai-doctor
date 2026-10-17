@@ -11,7 +11,7 @@ const { label } = await import(`data:text/javascript;base64,${Buffer.from(output
 
 test('navigation, statuses, severity, roles and result headings have Russian display labels', () => {
   for (const value of [
-    'Dashboard', 'Incidents', 'Deployments', 'Settings',
+    'Dashboard', 'Incidents', 'Exclusions', 'Alerts', 'Deployments', 'Settings', 'EXCLUDED',
     'NEW', 'OPEN', 'DIAGNOSED', 'FIXING', 'RESOLVED', 'NO_ACTION', 'SKIPPED',
     'PENDING', 'ANALYZING', 'COOLDOWN', 'QUEUED', 'RUNNING', 'PREPARING', 'TESTING',
     'READY', 'DONE', 'FAILED', 'BUDGET_EXHAUSTED', 'INTERRUPTED', 'DEPLOYING',

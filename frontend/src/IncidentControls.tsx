@@ -12,6 +12,16 @@ export function IncidentControls({ id, status, refresh }: { id: number; status: 
   const [confirm, setConfirm] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
+  const [exclusionConfirm, setExclusionConfirm] = useState(false)
+  const excluded = status === 'EXCLUDED'
+  const changeExclusion = async () => {
+    setBusy(true); setError('')
+    try {
+      await mutate(`/incidents/${id}/${excluded ? 'restore' : 'exclude'}`, { confirmed: true })
+      setExclusionConfirm(false); refresh()
+    } catch (error) { setError(error instanceof Error ? error.message : String(error)) }
+    finally { setBusy(false) }
+  }
   const act = async (remove = false) => {
     setBusy(true); setError('')
     try {
@@ -21,11 +31,19 @@ export function IncidentControls({ id, status, refresh }: { id: number; status: 
     finally { setBusy(false) }
   }
   return <div className="incident-controls">
-    <label>Статус<select aria-label="Статус инцидента" value={selected} onChange={event => setSelected(event.target.value)}>{incidentStatuses.map(value => <option key={value} value={value}>{label(value)}</option>)}</select></label>
+    {!excluded && <><label>Статус<select aria-label="Статус инцидента" value={selected} onChange={event => setSelected(event.target.value)}>{incidentStatuses.map(value => <option key={value} value={value}>{label(value)}</option>)}</select></label>
     <button className="button" disabled={busy || selected === status} onClick={() => act()}>Изменить статус</button>
-    <button className="button" disabled={busy} onClick={() => setConfirm(true)}>Удалить инцидент</button>
+    <button className="button" disabled={busy} onClick={() => setConfirm(true)}>Удалить инцидент</button></>}
+    <button className="button" disabled={busy} onClick={() => setExclusionConfirm(true)}>{excluded ? 'Вернуть в инциденты' : 'Исключить этот тип ошибок'}</button>
+    {excluded && <p className="small muted">Этот тип ошибок не анализируется агентом. Повторы сохраняются здесь, в том числе после обновления приложения.</p>}
     {status === 'NO_ACTION' && <p className="small muted">Автоматический анализ отключён. Повторения не переоткроют инцидент.</p>}
     {error && <ErrorNotice>{error}</ErrorNotice>}
+    {exclusionConfirm && <ConfirmDialog title={excluded ? 'Вернуть тип ошибки в инциденты?' : 'Исключить этот тип ошибок?'} onClose={() => { if (!busy) setExclusionConfirm(false) }}>
+      <p>{excluded ? 'Правило исключения будет отключено. Все исключённые ошибки этого типа вернутся в инциденты. Анализ можно запустить вручную; новые инциденты снова будут анализироваться автоматически.' : 'Совпадающие инциденты и будущие повторения попадут в «Исключения», без автоматической диагностики. Ожидающие работы будут отменены. При активной работе действие заблокировано.'}</p>
+      <p>Сопоставляем текст, тип исключения, первопричину, сервис, важность, источник и кадры стека. Игнорируем UUID, время, идентификаторы запросов, версию приложения и номера строк. Остальные числа, пути и HTTP-коды должны совпадать.</p>
+      {error && <ErrorNotice>{error}</ErrorNotice>}
+      <div className="dialog-actions"><button className="button" disabled={busy} onClick={() => setExclusionConfirm(false)}>Отмена</button><button className="button primary" disabled={busy} onClick={changeExclusion}>{excluded ? 'Вернуть в инциденты' : 'Исключить тип ошибок'}</button></div>
+    </ConfirmDialog>}
     {confirm && <ConfirmDialog title={`Удалить инцидент #${id}?`} onClose={() => { if (!busy) setConfirm(false) }}>
       <p>Инцидент, диагностики, чат, логи сессии и история исправлений и развёртываний будут удалены без возможности восстановления. Файлы и ветки Git останутся на хосте. При активной работе удаление заблокировано. Новая ошибка может создать новый инцидент.</p>
       {error && <ErrorNotice>{error}</ErrorNotice>}

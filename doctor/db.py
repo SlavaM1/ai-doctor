@@ -98,6 +98,26 @@ class State(Base):
     value: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
+class ExclusionRule(Base):
+    __tablename__ = 'exclusion_rules'
+    signature: Mapped[str] = mapped_column(String(64), primary_key=True)
+    created_at: Mapped[str] = mapped_column(default=now)
+    sample: Mapped[dict] = mapped_column(JSON)
+
+
+class User(Base):
+    __tablename__ = 'users'
+    username: Mapped[str] = mapped_column(primary_key=True)
+    password_hash: Mapped[str] = mapped_column(Text)
+
+
+class LoginSession(Base):
+    __tablename__ = 'login_sessions'
+    token_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    username: Mapped[str] = mapped_column(ForeignKey('users.username'))
+    expires_at: Mapped[str] = mapped_column(index=True)
+
+
 class SessionLogEvent(Base):
     __tablename__ = 'session_log_events'
     __table_args__ = {'sqlite_autoincrement': True}

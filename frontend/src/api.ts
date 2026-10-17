@@ -16,6 +16,7 @@ export async function request<T>(path: string, options?: RequestInit): Promise<T
     throw new Error(response.ok ? 'API вернул ответ не в формате JSON. Проверьте прокси /api.' : `Ошибка запроса к API (${response.status}).`)
   }
   if (!response.ok) {
+    if (response.status === 401 && path !== '/auth/login') window.dispatchEvent(new Event('doctor-unauthorized'))
     const detail = value && typeof value === 'object' && 'detail' in value ? (value as { detail: unknown }).detail : value
     throw new Error(typeof detail === 'string' ? detail : `Ошибка запроса к API (${response.status})${detail ? `: ${JSON.stringify(detail)}` : '.'}`)
   }
@@ -42,11 +43,12 @@ export function useApi<T>(path: string | null, revision = 0) {
   return state.path === path ? state : { path, loading: !!path, data: undefined, error: undefined }
 }
 
-export function useLiveEvents(onRefresh: (settingsChanged?: boolean) => void) {
+export function useLiveEvents(onRefresh: (settingsChanged?: boolean) => void, enabled = true) {
   const [connection, setConnection] = useState<'connecting' | 'live' | 'reconnecting'>('connecting')
   const callback = useRef(onRefresh)
   callback.current = onRefresh
   useEffect(() => {
+    if (!enabled) return
     let timer: ReturnType<typeof setTimeout> | undefined
     let settingsChanged = false
     const events = new EventSource('/api/events')
@@ -56,8 +58,11 @@ export function useLiveEvents(onRefresh: (settingsChanged?: boolean) => void) {
       if (timer) clearTimeout(timer)
       timer = setTimeout(() => { callback.current(settingsChanged); settingsChanged = false }, 350)
     }
-    events.onerror = () => setConnection('reconnecting')
+    events.onerror = () => {
+      setConnection('reconnecting')
+      request('/auth/me').catch(() => { /* Unauthorized responses return to login. */ })
+    }
     return () => { events.close(); if (timer) clearTimeout(timer) }
-  }, [])
+  }, [enabled])
   return connection
 }

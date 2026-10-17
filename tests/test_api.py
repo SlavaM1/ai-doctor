@@ -9,6 +9,14 @@ import asyncio
 import httpx
 
 
+def authenticated_client(factory):
+    with factory.begin() as session:
+        main.auth.seed_admin(session)
+    client = TestClient(main.app, base_url='http://127.0.0.1')
+    assert client.post('/auth/login', headers={'X-Doctor-Action': '1'}, json={'username': 'admin', 'password': 'admin'}).status_code == 200
+    return client
+
+
 @pytest.fixture
 def controls(monkeypatch):
     from sqlalchemy import event
@@ -21,7 +29,7 @@ def controls(monkeypatch):
     monkeypatch.setattr(main, 'Session', factory)
     with factory.begin() as session:
         session.add(Incident(id=1, fingerprint='controls', diagnosis_status='DONE'))
-    return TestClient(main.app, base_url='http://127.0.0.1'), factory, {'X-Doctor-Action': '1'}
+    return authenticated_client(factory), factory, {'X-Doctor-Action': '1'}
 
 
 def test_delete_confirmation_links_pending_work_and_id_nonreuse(controls):
@@ -135,7 +143,7 @@ def test_restart_interrupted_deploy_still_blocks_controls_and_preserves_history(
         session.flush()
         session.add(Deployment(id=1, fix_job_id=1, status='DEPLOYING', result={'evidence': 'preserve'}))
     stub_control_restart(monkeypatch)
-    with TestClient(main.app, base_url='http://127.0.0.1') as restarted:
+    with TestClient(main.app, base_url='http://127.0.0.1', cookies=controls[0].cookies) as restarted:
         assert restarted.request('DELETE', '/incidents/1', headers=headers, json={'confirmed': True}).status_code == 409
         for status in ('NO_ACTION', 'RESOLVED', 'OPEN'):
             assert restarted.patch('/incidents/1/status', headers=headers, json={'status': status}).status_code == 409
@@ -167,7 +175,7 @@ def test_git_timeout_and_restart_do_not_release_durable_guard(controls, monkeypa
         value = session.get(State, 'manual-git:1').value
         assert value['status'] == 'UNKNOWN' and 'Sensitive' not in repr(value)
     stub_control_restart(monkeypatch)
-    with TestClient(main.app, base_url='http://127.0.0.1') as restarted:
+    with TestClient(main.app, base_url='http://127.0.0.1', cookies=controls[0].cookies) as restarted:
         assert restarted.request('DELETE', '/incidents/1', headers=headers, json={'confirmed': True}).status_code == 409
         assert restarted.patch('/incidents/1/status', headers=headers, json={'status': 'NO_ACTION'}).status_code == 409
         assert restarted.post('/fixes/1/git', headers=headers, json=body).status_code == 409
@@ -204,7 +212,7 @@ def test_restart_preserves_unacknowledged_running_git_admission(controls, monkey
         # Simulate process death after durable admission, before any response.
         session.add(State(key='manual-git:1', value={'status': 'RUNNING', 'operation_id': 'old-request', 'action': 'push'}))
     stub_control_restart(monkeypatch)
-    with TestClient(main.app, base_url='http://127.0.0.1') as restarted:
+    with TestClient(main.app, base_url='http://127.0.0.1', cookies=controls[0].cookies) as restarted:
         with factory() as session:
             assert session.get(State, 'manual-git:1').value['status'] == 'UNKNOWN'
         assert restarted.request('DELETE', '/incidents/1', headers=headers, json={'confirmed': True}).status_code == 409
@@ -295,7 +303,7 @@ def test_deploy_requires_approval_exact_diff_and_ready_tests(monkeypatch):
         session.add(incident)
         session.flush()
         session.add(FixJob(id=1, incident_id=incident.id, status='READY', patch_sha='a' * 64, tests={'passed': True}))
-    client = TestClient(main.app, base_url='http://127.0.0.1')
+    client = authenticated_client(factory)
     headers = {'X-Doctor-Action': '1'}
     assert client.post('/fixes/1/deploy', headers=headers, json={'confirmed': False, 'patch_sha': 'a' * 64}).status_code == 403
     assert client.post('/fixes/1/deploy', headers=headers, json={'confirmed': True, 'patch_sha': 'b' * 64}).status_code == 409
@@ -319,7 +327,7 @@ def test_explicit_continuation_does_not_reset_call_budget(monkeypatch):
         session.add(job)
         session.flush()
         session.add(AgentRun(incident_id=incident.id, kind='fix', calls=4))
-    client = TestClient(main.app, base_url='http://127.0.0.1')
+    client = authenticated_client(factory)
     response = client.post('/fixes/1/continue', headers={'X-Doctor-Action': '1'})
     assert response.status_code == 409
     with factory.begin() as session:
@@ -342,6 +350,128 @@ def test_superseded_job_cannot_escape_budget_attribution_window(monkeypatch):
         session.add(AgentRun(incident_id=incident.id, kind='fix', calls=3))
         session.flush()
         session.add(FixJob(id=2, incident_id=incident.id, status='FAILED'))
-    client = TestClient(main.app, base_url='http://127.0.0.1')
+    client = authenticated_client(factory)
     response = client.post('/fixes/1/continue', headers={'X-Doctor-Action': '1'})
     assert response.status_code == 409 and 'Superseded' in response.json()['detail']
+
+
+def test_authentication_required_for_all_dashboard_data(controls):
+    _, _, headers = controls
+    anonymous = TestClient(main.app, base_url='http://127.0.0.1')
+    for path in ('/incidents', '/incidents/1', '/status', '/settings', '/models', '/deployments', '/events', '/docs', '/openapi.json', '/auth/me'):
+        assert anonymous.get(path).status_code == 401
+    assert anonymous.post('/incidents/1/analyze', headers=headers, json={}).status_code == 401
+    assert anonymous.get('/health').status_code == 200
+
+
+def test_login_logout_cookie_revocation_and_password_storage(controls):
+    from doctor.db import User, LoginSession
+    client, factory, headers = controls
+    assert client.get('/auth/me').json() == {'username': 'admin'}
+    assert client.get('/incidents').headers['cache-control'] == 'no-store'
+    old_cookie = client.cookies.get(main.auth.COOKIE)
+    with factory() as session:
+        assert session.get(User, 'admin').password_hash != 'admin'
+        assert session.get(LoginSession, old_cookie) is None
+        assert session.get(LoginSession, main.auth.token_hash(old_cookie))
+    assert client.post('/auth/logout', headers=headers).status_code == 200
+    assert client.get('/incidents').status_code == 401
+    replay = TestClient(main.app, base_url='http://127.0.0.1', cookies={main.auth.COOKIE: old_cookie})
+    assert replay.get('/incidents').status_code == 401
+    bad = client.post('/auth/login', headers=headers, json={'username': 'admin', 'password': 'wrong'})
+    unknown = client.post('/auth/login', headers=headers, json={'username': 'nobody', 'password': 'wrong'})
+    assert bad.status_code == unknown.status_code == 401 and bad.json() == unknown.json()
+    response = client.post('/auth/login', headers=headers, json={'username': 'admin', 'password': 'admin'})
+    assert response.status_code == 200
+    assert 'HttpOnly' in response.headers['set-cookie'] and 'SameSite=strict' in response.headers['set-cookie']
+
+
+def test_expired_session_and_login_rate_limit(controls):
+    from doctor.db import LoginSession
+    client, factory, headers = controls
+    with factory.begin() as session:
+        session.query(LoginSession).first().expires_at = '2000-01-01T00:00:00+00:00'
+    assert client.get('/incidents').status_code == 401
+    for _ in range(4):
+        assert client.post('/auth/login', headers=headers, json={'username': 'admin', 'password': 'wrong'}).status_code == 401
+    assert client.post('/auth/login', headers=headers, json={'username': 'admin', 'password': 'admin'}).status_code == 429
+
+
+def exclusion_event(**changes):
+    return {'service': 'app', 'severity': 'ERROR', 'exception_type': 'java.lang.IllegalStateException',
+            'message': 'Remote service returned HTTP 404 requestId=abc', 'root_cause': 'not found',
+            'logger': 'com.aurel.Service', 'application_frames': [{'class': 'com.aurel.Service', 'method': 'save', 'filename': 'Service.java', 'line': 42}],
+            'version': 'v1', 'source_id': 'first', **changes}
+
+
+def test_exclusion_family_future_versions_and_manual_restore(controls):
+    from doctor import monitoring
+    from doctor.db import Deployment, State, ExclusionRule
+    client, factory, headers = controls
+    event = exclusion_event()
+    with factory.begin() as session:
+        row = session.get(Incident, 1)
+        row.event, row.fingerprint = event, monitoring.fingerprint(event)
+        session.add(FixJob(id=1, incident_id=1, status='QUEUED'))
+        session.flush()
+        session.add(Deployment(fix_job_id=1, status='QUEUED'))
+        session.add(State(key='cooldown:1', value={'until': 0}))
+    assert client.post('/incidents/1/exclude', headers=headers, json={'confirmed': False}).status_code == 403
+    assert client.post('/incidents/1/exclude', headers=headers, json={'confirmed': True}).json() == {'excluded': [1]}
+    assert client.get('/incidents').json() == []
+    assert client.get('/incidents?excluded=true').json()[0]['id'] == 1
+    with factory() as session:
+        assert session.get(FixJob, 1).status == session.query(Deployment).first().status == 'ABORTED'
+        assert session.get(State, 'cooldown:1') is None
+    for action in ('analyze', 'fix', 'chat'):
+        assert client.post(f'/incidents/1/{action}', headers=headers, json={'message': 'explain'}).status_code == 409
+    assert client.patch('/incidents/1/status', headers=headers, json={'status': 'NEW'}).status_code == 409
+    assert client.request('DELETE', '/incidents/1', headers=headers, json={'confirmed': True}).status_code == 409
+    with factory.begin() as session:
+        repeated, _ = monitoring.store_event(session, exclusion_event(source_id='repeat', message=event['message'].replace('abc', 'def')))
+        upgraded, _ = monitoring.store_event(session, exclusion_event(source_id='upgrade', version='v2'))
+        assert repeated == 1 and upgraded != 1
+        assert session.get(Incident, upgraded).status == 'EXCLUDED'
+        assert session.get(Incident, upgraded).diagnosis_status == 'SKIPPED'
+    assert len(client.get('/incidents?excluded=true').json()) == 2
+    restored = client.post(f'/incidents/{upgraded}/restore', headers=headers, json={'confirmed': True})
+    assert restored.status_code == 200 and set(restored.json()['restored']) == {1, upgraded}
+    assert client.get('/incidents?excluded=true').json() == []
+    with factory.begin() as session:
+        assert session.query(ExclusionRule).count() == 0
+        assert session.get(Incident, 1).status == 'NEW'
+        assert session.get(Incident, 1).diagnosis_status == 'SKIPPED'
+        fresh, _ = monitoring.store_event(session, exclusion_event(source_id='future', version='v3'))
+        assert session.get(Incident, fresh).diagnosis_status == 'PENDING'
+
+
+def test_exclusion_never_swallows_different_numbers_with_same_legacy_fingerprint(controls):
+    from doctor import monitoring
+    client, factory, headers = controls
+    event = exclusion_event()
+    with factory.begin() as session:
+        row = session.get(Incident, 1)
+        row.event, row.fingerprint = event, monitoring.fingerprint(event)
+    assert client.post('/incidents/1/exclude', headers=headers, json={'confirmed': True}).status_code == 200
+    different = exclusion_event(source_id='new-error', message=event['message'].replace('404', '500'))
+    assert monitoring.fingerprint(different) == monitoring.fingerprint(event)
+    with factory.begin() as session:
+        new_id, _ = monitoring.store_event(session, different)
+        assert new_id != 1
+        assert session.get(Incident, new_id).status == 'NEW'
+        assert session.get(Incident, new_id).diagnosis_status == 'PENDING'
+        same_id, _ = monitoring.store_event(session, {**different, 'source_id': 'new-error-repeat'})
+        assert same_id == new_id
+        assert session.get(Incident, 1).status == 'EXCLUDED'
+
+
+def test_excluding_family_is_atomic_when_one_member_has_active_work(controls):
+    from doctor.db import ExclusionRule
+    client, factory, headers = controls
+    with factory.begin() as session:
+        session.get(Incident, 1).event = exclusion_event()
+        session.add(Incident(id=2, fingerprint='other-version', event=exclusion_event(version='v2'), diagnosis_status='ANALYZING'))
+    assert client.post('/incidents/1/exclude', headers=headers, json={'confirmed': True}).status_code == 409
+    with factory() as session:
+        assert session.query(ExclusionRule).count() == 0
+        assert session.get(Incident, 1).status == 'NEW'

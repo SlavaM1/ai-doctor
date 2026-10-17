@@ -69,10 +69,11 @@ def test_all_incident_prompts_require_russian_and_narrow_context():
 
 
 @pytest.mark.asyncio
-async def test_ignored_incident_is_not_claimed_even_if_pending(isolated):
+@pytest.mark.parametrize('status', ['NO_ACTION', 'EXCLUDED'])
+async def test_ignored_incident_is_not_claimed_even_if_pending(isolated, status):
     _, factory = isolated
     with factory.begin() as session:
-        session.add(Incident(id=1, fingerprint='ignored', status='NO_ACTION', diagnosis_status='PENDING'))
+        session.add(Incident(id=1, fingerprint='ignored', status=status, diagnosis_status='PENDING'))
     assert await ai.diagnose(1) is None
     with factory() as session:
         assert session.query(AgentRun).count() == 0

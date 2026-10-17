@@ -45,3 +45,12 @@ test('manual Git controls cannot publish unready patches', () => {
   assert.match(html, /Создать коммит/)
   assert.match(html, /Отправить в GitHub/)
 })
+
+test('excluded errors offer restoration rather than status bypass or deletion', () => {
+  const html = renderToStaticMarkup(React.createElement(IncidentControls, { id: 1, status: 'EXCLUDED', refresh() {} }))
+  assert.match(html, /Вернуть в инциденты/)
+  assert.match(html, /не анализируется агентом/)
+  assert.doesNotMatch(html, /Изменить статус|Удалить инцидент/)
+  const normal = renderToStaticMarkup(React.createElement(IncidentControls, { id: 1, status: 'NEW', refresh() {} }))
+  assert.match(normal, /Исключить этот тип ошибок/)
+})

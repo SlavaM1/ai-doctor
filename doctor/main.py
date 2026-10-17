@@ -2,17 +2,20 @@ import asyncio
 import hmac
 import json
 import uuid
+import time
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Literal
 import httpx
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import select, func, delete
 from .config import get_settings
-from .db import Session, init_db, Incident, Occurrence, Diagnosis, FixJob, Deployment, AgentRun, State, IncidentLogWindow, serialize, now, next_id
+from .db import Session, init_db, Incident, Occurrence, Diagnosis, FixJob, Deployment, AgentRun, State, IncidentLogWindow, ExclusionRule, LoginSession, serialize, now, next_id
+from . import auth
+from .exclusions import signature
 from .bus import bus
 from .runner_client import runner_call
 from .monitoring import ingest_batch, retention, flush_pending, release_cooldowns
@@ -24,7 +27,7 @@ async def diagnosis_worker():
     while True:
         try:
             with Session() as session:
-                ids = list(session.scalars(select(Incident.id).where(Incident.diagnosis_status == 'PENDING', Incident.status != 'NO_ACTION').order_by(Incident.id).limit(get_settings().max_diagnosis_queue)))
+                ids = list(session.scalars(select(Incident.id).where(Incident.diagnosis_status == 'PENDING', Incident.status.not_in(['NO_ACTION', 'EXCLUDED'])).order_by(Incident.id).limit(get_settings().max_diagnosis_queue)))
             for incident_id in ids:
                 with Session() as session:
                     choice = session.get(State, f'diagnosis-model:{incident_id}')
@@ -80,6 +83,7 @@ PUBLIC_SETTINGS = {'default_diagnosis_model', 'default_fix_model', 'max_context_
 async def lifespan(app):
     init_db()
     with Session.begin() as session:
+        auth.seed_admin(session)
         saved = session.get(State, 'settings')
         if saved:
             for key, value in saved.value.items():
@@ -111,13 +115,64 @@ app.add_middleware(TrustedHostMiddleware, allowed_hosts=['localhost', '127.0.0.1
 async def local_control(request: Request, call_next):
     if request.method not in {'GET', 'HEAD', 'OPTIONS'} and not request.url.path.startswith('/internal/'):
         if request.headers.get('X-Doctor-Action') != '1':
-            from fastapi.responses import JSONResponse
-            return JSONResponse({'detail': 'Explicit local action header required'}, status_code=403)
+            return JSONResponse({'detail': 'Требуется заголовок подтверждения действия'}, status_code=403)
         origin = request.headers.get('origin')
         if origin and origin not in {'http://127.0.0.1:3050', 'http://localhost:3050', 'http://127.0.0.1:8050', 'http://localhost:8050'}:
-            from fastapi.responses import JSONResponse
-            return JSONResponse({'detail': 'Untrusted origin'}, status_code=403)
-    return await call_next(request)
+            return JSONResponse({'detail': 'Недоверенный источник запроса'}, status_code=403)
+    if request.url.path not in {'/health', '/auth/login', '/internal/logs'}:
+        with Session() as session:
+            username = auth.current_user(session, request.cookies.get(auth.COOKIE))
+        if not username:
+            return JSONResponse({'detail': 'Войдите в аккаунт'}, status_code=401)
+    response = await call_next(request)
+    response.headers['Cache-Control'] = 'no-store'
+    return response
+
+
+class LoginRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=100)
+    password: str = Field(min_length=1, max_length=200)
+
+
+@app.post('/auth/login')
+def login(request: Request, body: LoginRequest):
+    # Durable per-client limit, including unknown usernames; never store passwords.
+    key = 'login-attempts:' + auth.token_hash(request.client.host if request.client else 'local')
+    with incident_control_session() as session:
+        state = session.get(State, key)
+        attempts = [stamp for stamp in (state.value.get('times', []) if state else []) if stamp > time.time() - 60]
+        if len(attempts) >= 5:
+            raise HTTPException(429, 'Слишком много попыток входа. Повторите через минуту.')
+        session.merge(State(key=key, value={'times': attempts + [time.time()]}))
+        token = auth.login(session, body.username, body.password)
+        if token and request.cookies.get(auth.COOKIE):
+            old = session.get(LoginSession, auth.token_hash(request.cookies[auth.COOKIE]))
+            if old:
+                session.delete(old)
+    if not token:
+        raise HTTPException(401, 'Неверный логин или пароль')
+    response = JSONResponse({'username': body.username})
+    response.set_cookie(auth.COOKIE, token, max_age=auth.SESSION_SECONDS, httponly=True,
+                        samesite='strict', secure=request.url.scheme == 'https', path='/')
+    response.headers['Cache-Control'] = 'no-store'
+    return response
+
+
+@app.get('/auth/me')
+def me(request: Request):
+    with Session() as session:
+        return {'username': auth.current_user(session, request.cookies.get(auth.COOKIE))}
+
+
+@app.post('/auth/logout')
+def logout(request: Request):
+    with Session.begin() as session:
+        row = session.get(LoginSession, auth.token_hash(request.cookies.get(auth.COOKIE, '')))
+        if row:
+            session.delete(row)
+    response = JSONResponse({'ok': True})
+    response.delete_cookie(auth.COOKIE, path='/')
+    return response
 
 
 @app.get('/health')
@@ -154,7 +209,7 @@ async def status():
     current = datetime.now(timezone.utc)
     with Session() as session:
         collector = session.get(State, 'collector')
-        stats = {'active_incidents': session.scalar(select(func.count()).select_from(Incident).where(Incident.status.not_in(['RESOLVED', 'NO_ACTION']))),
+        stats = {'active_incidents': session.scalar(select(func.count()).select_from(Incident).where(Incident.status.not_in(['RESOLVED', 'NO_ACTION', 'EXCLUDED']))),
                  'errors_hour': session.scalar(select(func.count()).select_from(Occurrence).where(Occurrence.seen_at >= (current - timedelta(hours=1)).isoformat())),
                  'errors_day': session.scalar(select(func.count()).select_from(Occurrence).where(Occurrence.seen_at >= (current - timedelta(days=1)).isoformat())),
                  'completed_fixes': session.scalar(select(func.count()).select_from(FixJob).where(FixJob.status == 'DEPLOYED'))}
@@ -168,8 +223,9 @@ async def status():
 
 
 @app.get('/incidents')
-def incidents(status: str = '', severity: str = ''):
+def incidents(status: str = '', severity: str = '', excluded: bool = False):
     query = select(Incident).order_by(Incident.last_seen.desc()).limit(300)
+    query = query.where(Incident.status == 'EXCLUDED' if excluded else Incident.status != 'EXCLUDED')
     if status:
         query = query.where(Incident.status == status)
     if severity:
@@ -222,6 +278,8 @@ async def change_incident_status(incident_id: int, body: IncidentStatusRequest):
     with incident_control_session() as session:
         incident = require_incident(session, incident_id)
         require_idle(session, incident)
+        if incident.status == 'EXCLUDED':
+            raise HTTPException(409, 'Сначала верните тип ошибки из исключений')
         incident.status = body.status
         if body.status in {'NO_ACTION', 'RESOLVED'}:
             cancel_queued(session, incident)
@@ -238,6 +296,50 @@ class ConfirmationRequest(BaseModel):
     confirmed: bool = False
 
 
+@app.post('/incidents/{incident_id}/exclude')
+async def exclude_incident(incident_id: int, body: ConfirmationRequest):
+    if not body.confirmed:
+        raise HTTPException(403, 'Подтвердите исключение этого типа ошибок')
+    with incident_control_session() as session:
+        incident = require_incident(session, incident_id)
+        key = signature(incident.event)
+        if not incident.event.get('message', '').strip():
+            raise HTTPException(409, 'Недостаточно данных для безопасного исключения')
+        matching = [row for row in session.scalars(select(Incident)) if signature(row.event) == key]
+        for row in matching:
+            require_idle(session, row)
+        session.merge(ExclusionRule(signature=key, sample=incident.event))
+        for row in matching:
+            cancel_queued(session, row)
+            row.status, row.diagnosis_status = 'EXCLUDED', 'SKIPPED'
+            cooldown = session.get(State, f'cooldown:{row.id}')
+            if cooldown:
+                session.delete(cooldown)
+    await bus.publish('incidents')
+    return {'excluded': [row.id for row in matching]}
+
+
+@app.post('/incidents/{incident_id}/restore')
+async def restore_incident(incident_id: int, body: ConfirmationRequest):
+    if not body.confirmed:
+        raise HTTPException(403, 'Подтвердите возврат типа ошибки в инциденты')
+    with incident_control_session() as session:
+        incident = require_incident(session, incident_id)
+        if incident.status != 'EXCLUDED':
+            raise HTTPException(409, 'Инцидент не находится в исключениях')
+        key = signature(incident.event)
+        matching = [row for row in session.scalars(select(Incident).where(Incident.status == 'EXCLUDED')) if signature(row.event) == key]
+        for row in matching:
+            require_idle(session, row)
+        rule = session.get(ExclusionRule, key)
+        if rule:
+            session.delete(rule)
+        for row in matching:
+            row.status, row.diagnosis_status = 'NEW', 'SKIPPED'
+    await bus.publish('incidents')
+    return {'restored': [row.id for row in matching]}
+
+
 @app.delete('/incidents/{incident_id}')
 async def delete_incident(incident_id: int, body: ConfirmationRequest):
     if not body.confirmed:
@@ -245,6 +347,8 @@ async def delete_incident(incident_id: int, body: ConfirmationRequest):
     with incident_control_session() as session:
         incident = require_incident(session, incident_id)
         require_idle(session, incident)
+        if incident.status == 'EXCLUDED':
+            raise HTTPException(409, 'Перед удалением верните тип ошибки из исключений')
         jobs = select(FixJob.id).where(FixJob.incident_id == incident_id)
         next_id(session, Incident)
         next_id(session, FixJob)
@@ -301,7 +405,7 @@ class AnalyzeRequest(BaseModel):
 async def analyze(incident_id: int, body: AnalyzeRequest):
     from .ai import select_model
     with Session() as session:
-        if require_incident(session, incident_id).status == 'NO_ACTION':
+        if require_incident(session, incident_id).status in {'NO_ACTION', 'EXCLUDED'}:
             raise HTTPException(409, 'Сначала измените статус «Не требует решения»')
     try:
         model = await select_model('diagnosis', body.model)
@@ -309,7 +413,7 @@ async def analyze(incident_id: int, body: AnalyzeRequest):
         raise HTTPException(503, redact(str(exc))[:400]) from exc
     with Session.begin() as session:
         incident = require_incident(session, incident_id)
-        if incident.status == 'NO_ACTION':
+        if incident.status in {'NO_ACTION', 'EXCLUDED'}:
             raise HTTPException(409, 'Сначала измените статус «Не требует решения»')
         if incident.diagnosis_status in {'PENDING', 'ANALYZING'}:
             raise HTTPException(409, 'Diagnosis already queued or running')
@@ -327,7 +431,7 @@ class FixRequest(AnalyzeRequest):
 async def fix(incident_id: int, body: FixRequest):
     from .ai import select_model
     with Session() as session:
-        if require_incident(session, incident_id).status == 'NO_ACTION':
+        if require_incident(session, incident_id).status in {'NO_ACTION', 'EXCLUDED'}:
             raise HTTPException(409, 'Сначала измените статус «Не требует решения»')
     try:
         model = await select_model('fix', body.model)
@@ -335,7 +439,7 @@ async def fix(incident_id: int, body: FixRequest):
         raise HTTPException(503, redact(str(exc))[:400]) from exc
     with Session.begin() as session:
         incident = require_incident(session, incident_id)
-        if incident.status == 'NO_ACTION':
+        if incident.status in {'NO_ACTION', 'EXCLUDED'}:
             raise HTTPException(409, 'Сначала измените статус «Не требует решения»')
         if session.scalar(select(FixJob.id).where(FixJob.status.in_(['QUEUED', 'RUNNING', 'PREPARING', 'TESTING']))):
             raise HTTPException(409, 'Another fix is queued or running')
@@ -368,7 +472,7 @@ async def continue_fix(job_id: int):
         job = session.get(FixJob, job_id)
         if not job:
             raise HTTPException(404, 'Fix not found')
-        if require_incident(session, job.incident_id).status == 'NO_ACTION':
+        if require_incident(session, job.incident_id).status in {'NO_ACTION', 'EXCLUDED'}:
             raise HTTPException(409, 'Сначала измените статус «Не требует решения»')
         if job.status not in {'FAILED', 'BUDGET_EXHAUSTED', 'INTERRUPTED'}:
             raise HTTPException(409, 'Only stopped jobs may be explicitly continued')
@@ -410,7 +514,7 @@ async def manual_git(job_id: int, body: ManualGitRequest):
             job = session.get(FixJob, job_id)
             if not job:
                 raise HTTPException(404, 'Исправление не найдено')
-            if require_incident(session, job.incident_id).status == 'NO_ACTION':
+            if require_incident(session, job.incident_id).status in {'NO_ACTION', 'EXCLUDED'}:
                 raise HTTPException(409, 'Сначала измените статус «Не требует решения»')
             if job.status not in {'READY', 'DEPLOYED'} or not job.patch_sha or not hmac.compare_digest(body.patch_sha, job.patch_sha):
                 raise HTTPException(409, 'Исправление не готово или его хеш изменился')
@@ -455,7 +559,7 @@ async def deploy(job_id: int, body: DeployRequest):
         job = session.get(FixJob, job_id)
         if not job:
             raise HTTPException(404, 'Fix not found')
-        if require_incident(session, job.incident_id).status == 'NO_ACTION':
+        if require_incident(session, job.incident_id).status in {'NO_ACTION', 'EXCLUDED'}:
             raise HTTPException(409, 'Сначала измените статус «Не требует решения»')
         if job.status != 'READY' or not job.patch_sha or not hmac.compare_digest(body.patch_sha, job.patch_sha):
             raise HTTPException(409, 'Fix is not ready or diff changed')
@@ -490,6 +594,8 @@ async def chat(incident_id: int, body: ChatRequest):
     async with chat_lock:
         with Session() as session:
             incident = require_incident(session, incident_id)
+            if incident.status == 'EXCLUDED':
+                raise HTTPException(409, 'Сначала верните тип ошибки из исключений')
             diagnosis = session.scalar(select(Diagnosis).where(Diagnosis.incident_id == incident_id).order_by(Diagnosis.id.desc()))
             event = incident.event
             context = {'incident': {key: event.get(key) for key in ('exception_type', 'message', 'root_cause', 'service', 'version')},
@@ -554,5 +660,11 @@ async def update_settings(body: SettingsUpdate):
 
 
 @app.get('/events')
-async def events():
-    return StreamingResponse(bus.stream(), media_type='text/event-stream', headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
+async def events(request: Request):
+    async def authenticated_stream():
+        async for message in bus.stream():
+            with Session() as session:
+                if not auth.current_user(session, request.cookies.get(auth.COOKIE)):
+                    break
+            yield message
+    return StreamingResponse(authenticated_stream(), media_type='text/event-stream', headers={'Cache-Control': 'no-store', 'X-Accel-Buffering': 'no'})

@@ -1,6 +1,8 @@
 const labels: Record<string, string> = {
   Dashboard: 'Обзор',
   Incidents: 'Инциденты',
+  Exclusions: 'Исключения',
+  Alerts: 'Настройка алертов',
   Deployments: 'Развёртывания',
   Settings: 'Настройки',
   NEW: 'Новый',
@@ -9,6 +11,7 @@ const labels: Record<string, string> = {
   FIXING: 'Исправляется',
   RESOLVED: 'Решён',
   NO_ACTION: 'Не требует решения',
+  EXCLUDED: 'В исключениях',
   SKIPPED: 'Пропущено',
   PENDING: 'Ожидает',
   ANALYZING: 'Анализируется',

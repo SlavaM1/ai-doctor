@@ -5,7 +5,8 @@ import time
 from datetime import datetime, timedelta, timezone
 from sqlalchemy import select, delete
 from .config import get_settings
-from .db import Base, Session, State, Incident, Occurrence, Diagnosis, now, next_id
+from .db import Base, Session, State, Incident, Occurrence, Diagnosis, ExclusionRule, now, next_id
+from .exclusions import signature
 from sqlalchemy.orm import Mapped, mapped_column
 from .security import redact
 
@@ -132,19 +133,31 @@ def store_event(session, event: dict) -> tuple[int | None, bool]:
     if session.scalar(select(Occurrence.id).where(Occurrence.source_id == event['source_id'])):
         return None, False
     fp = fingerprint(event)
+    key = signature(event)
+    excluded = session.get(ExclusionRule, key) is not None
     incident = session.scalar(select(Incident).where(Incident.fingerprint == fp))
+    # Legacy fingerprints normalize ALL numbers. Never let an excluded HTTP 404,
+    # for example, swallow a new HTTP 500 that shares that broader fingerprint.
+    strict_fp = hashlib.sha256((fp + ':' + key).encode()).hexdigest()
+    variant = session.scalar(select(Incident).where(Incident.fingerprint == strict_fp))
+    if variant:
+        incident = variant
+    elif incident and signature(incident.event) != key and (excluded or incident.status == 'EXCLUDED'):
+        incident, fp = None, strict_fp
     created = incident is None
     if created:
         incident = Incident(id=next_id(session, Incident), fingerprint=fp, severity=event['severity'], exception_type=event['exception_type'],
                             message=event['message'], root_cause=event['root_cause'], service=event['service'],
                             version=event.get('version', ''), event=event)
         session.add(incident)
+        if excluded:
+            incident.status, incident.diagnosis_status = 'EXCLUDED', 'SKIPPED'
         session.flush()
     else:
         incident.occurrences += 1
         incident.last_seen = now()
         incident.event = event
-        if incident.status == 'RESOLVED':
+        if incident.status == 'RESOLVED' and not excluded:
             incident.status = 'NEW'
             latest = session.scalar(select(Diagnosis.created_at).where(Diagnosis.incident_id == incident.id).order_by(Diagnosis.id.desc()).limit(1))
             due = (datetime.fromisoformat(latest).timestamp() + get_settings().diagnosis_cooldown_seconds) if latest else 0
@@ -154,6 +167,8 @@ def store_event(session, event: dict) -> tuple[int | None, bool]:
             else:
                 incident.diagnosis_status = 'PENDING'
             created = True
+    if excluded:
+        incident.status, incident.diagnosis_status = 'EXCLUDED', 'SKIPPED'
     session.add(Occurrence(incident_id=incident.id, source_id=event['source_id']))
     from .session_logs import snapshot
     snapshot(session, incident.id, event)
@@ -239,7 +254,7 @@ def release_cooldowns() -> list[int]:
     with Session.begin() as session:
         for state in session.scalars(select(State).where(State.key.like('cooldown:%'))):
             incident = session.get(Incident, int(state.key.split(':')[1]))
-            if not incident or incident.status == 'NO_ACTION' or incident.diagnosis_status != 'COOLDOWN':
+            if not incident or incident.status in {'NO_ACTION', 'EXCLUDED'} or incident.diagnosis_status != 'COOLDOWN':
                 session.delete(state)
             elif state.value.get('until', 0) <= time.time():
                 incident.diagnosis_status = 'PENDING'

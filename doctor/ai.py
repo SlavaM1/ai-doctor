@@ -308,7 +308,7 @@ async def diagnose(incident_id: int, requested_model: str = '') -> dict | None:
     """
     with Session.begin() as session:
         claimed = session.execute(update(Incident).where(
-            Incident.id == incident_id, Incident.diagnosis_status == 'PENDING', Incident.status != 'NO_ACTION'
+            Incident.id == incident_id, Incident.diagnosis_status == 'PENDING', Incident.status.not_in(['NO_ACTION', 'EXCLUDED'])
         ).values(diagnosis_status='ANALYZING')).rowcount
         if not claimed:
             existing = session.get(Incident, incident_id)

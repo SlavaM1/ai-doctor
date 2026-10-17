@@ -78,6 +78,29 @@ def test_stable_fingerprint_normalizes_ids_uuid():
     assert m.normalize('id=132 d8ee9022-3caa-4896-a324-652b1ddf7909') == 'id=<n> <uuid>'
 
 
+def test_exclusion_signature_only_normalizes_known_volatile_values():
+    from doctor.exclusions import signature
+    from copy import deepcopy
+    event = java_event('123')
+    event['message'] = 'HTTP 404 /orders/123 requestId=abc d8ee9022-3caa-4896-a324-652b1ddf7909 at 2026-10-16T18:00:00Z'
+    same = deepcopy(event)
+    same['version'] = 'new-image'
+    same['application_frames'][0]['line'] = 99
+    same['message'] = event['message'].replace('abc', 'def').replace('d8ee9022', 'a8ee9022').replace('18:00:00', '19:01:00')
+    assert signature(same) == signature(event)
+    changes = [('message', event['message'].replace('404', '500')),
+               ('message', event['message'].replace('/orders/123', '/orders/999')),
+               ('message', event['message'].replace('HTTP', 'http')),
+               ('root_cause', 'new cause'), ('service', 'other'),
+               ('logger', 'other.logger'), ('severity', 'FATAL'), ('exception_type', 'java.lang.NullPointerException'),
+               ('application_frames', [])]
+    for key, value in changes:
+        assert signature({**event, key: value}) != signature(event)
+    header = '2026-10-16 18:00:00 ERROR 1 --- [nio-8080-exec-1] com.aurel.Service : HTTP 404 /orders'
+    other = header.replace('ERROR 1 ---', 'ERROR 99 ---').replace('exec-1', 'exec-3')
+    assert signature({**event, 'message': header}) == signature({**event, 'message': other})
+
+
 def test_dedup_persistence_and_reopen(store):
     new_count = 0
     with store.begin() as session:

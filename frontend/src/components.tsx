@@ -7,6 +7,8 @@ export function Icon({ name, size = 18 }: { name: string; size?: number }) {
     incidents: <><path d="m12 3 10 18H2L12 3Z" /><path d="M12 9v5m0 3h.01" /></>,
     deployments: <><path d="m12 3 8 5-8 5-8-5 8-5Zm-8 9 8 5 8-5M4 16l8 5 8-5" /></>,
     settings: <><path d="M4 7h16M4 17h16" /><circle cx="9" cy="7" r="3" /><circle cx="15" cy="17" r="3" /></>,
+    exclusions: <><path d="M3 7h7l2 2h9v11H3Z" /><path d="m9 13 6 4m0-4-6 4" /></>,
+    alerts: <><path d="M5 17h14l-2-3V9a5 5 0 0 0-10 0v5Zm5 3h4" /></>,
     pulse: <path d="M2 12h5l3-8 4 16 3-8h5" />,
     refresh: <><path d="M20 7v5h-5M4 17v-5h5" /><path d="M6 7a7 7 0 0 1 12-2l2 3M4 16l2 3a7 7 0 0 0 12-2" /></>,
     source: <><path d="m8 7-5 5 5 5m8-10 5 5-5 5m-3-13-2 20" /></>,
