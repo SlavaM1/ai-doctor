@@ -75,6 +75,44 @@ def test_fix_upfront_deploy_authorization_must_be_explicit_and_is_persisted(cont
         assert policy['auto_deploy'] is True and policy['confirmed_at']
 
 
+def test_stale_workspace_exposes_latest_deployment_and_allows_new_job(controls, monkeypatch):
+    from doctor import ai, fixing
+    from doctor.db import Deployment
+    client, factory, headers = controls
+    monkeypatch.setattr(fixing, 'Session', factory)
+
+    async def select_model(*args):
+        return 'verified-model'
+
+    monkeypatch.setattr(ai, 'select_model', select_model)
+    with factory.begin() as session:
+        session.add(FixJob(id=1, incident_id=1, status='FAILED',
+                           error='Runner HTTP 409: Workspace parent release changed; prepare a new fix'))
+        session.flush()
+        session.add(Deployment(fix_job_id=1, status='FAILED', result={'error': 'older result'}))
+        session.add(Deployment(fix_job_id=1, status='FAILED', result={'error': 'latest safe reason'}))
+    detail = client.get('/fixes/1').json()
+    assert detail['new_workspace_required'] is True
+    assert detail['deployment']['result']['error'] == 'latest safe reason'
+    assert client.post('/fixes/1/continue', headers=headers, json={}).status_code == 409
+    response = client.post('/incidents/1/fix', headers=headers, json={'goal': 'Новое исправление'})
+    assert response.status_code == 200 and response.json()['id'] != 1
+
+
+def test_fix_detail_exposes_exhausted_tool_budget_without_reset(controls, monkeypatch):
+    from doctor import fixing
+    from doctor.db import State
+    client, factory, headers = controls
+    monkeypatch.setattr(fixing, 'Session', factory)
+    with factory.begin() as session:
+        session.add(FixJob(id=1, incident_id=1, status='BUDGET_EXHAUSTED'))
+        session.add(State(key='fix-tools:1', value={'calls': 60}))
+    detail = client.get('/fixes/1').json()
+    assert detail['remaining_calls'] > 0
+    assert detail['tool_calls_used'] == 60 and detail['remaining_tool_calls'] == 0
+    assert client.post('/fixes/1/continue', headers=headers, json={}).status_code == 409
+
+
 def test_continue_can_change_goal_without_new_workspace_or_budget_and_revoke_auto_deploy(controls, monkeypatch):
     from doctor import fixing
     from doctor.db import State

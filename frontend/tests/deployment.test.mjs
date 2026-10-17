@@ -8,7 +8,7 @@ const source = readFileSync(new URL('../src/deployment.ts', import.meta.url), 'u
 const { outputText } = ts.transpileModule(source, {
   compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
 })
-const { canDeploy } = await import(`data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`)
+const { canContinueFix, canDeploy } = await import(`data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`)
 
 const sha = 'a'.repeat(64)
 const ready = {
@@ -44,4 +44,13 @@ test('rejects passing tests for a different patch or base commit', () => {
 
 test('supports an explicit pass when optional test hash metadata is not provided', () => {
   assert.equal(canDeploy({ ...ready, tests: { passed: true } }), true)
+})
+
+test('stale parent workspace must start a new job instead of endless continuation', () => {
+  const stopped = { ...ready, status: 'FAILED', remaining_calls: 20 }
+  assert.equal(canContinueFix(stopped), true)
+  assert.equal(canContinueFix({ ...stopped, new_workspace_required: true }), false)
+  assert.equal(canContinueFix({ ...stopped, superseded: true }), false)
+  assert.equal(canContinueFix({ ...stopped, remaining_calls: 0 }), false)
+  assert.equal(canContinueFix({ ...stopped, remaining_tool_calls: 0 }), false)
 })

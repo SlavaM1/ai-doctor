@@ -33,6 +33,7 @@ OUTPUT_LIMIT = 24000
 FILE_LIMIT = 1024 * 1024
 PATCH_LIMIT = 512 * 1024
 JAVA_ROOTS = ('src/main/java/', 'src/test/java/')
+RESOURCE_ROOTS = ('src/main/resources/templates/', 'src/main/resources/static/')
 _THREAD_LOCK = threading.RLock()
 
 
@@ -120,8 +121,9 @@ def safe_path(root, name, *, java=False):
     path = PurePosixPath(name)
     if path.is_absolute() or any(p in {'.', '..'} for p in name.split('/')) or _secret_path(name):
         fail('Forbidden filename')
-    if java and (not name.startswith(JAVA_ROOTS) or not name.endswith('.java')):
-        fail('Only Java source/test files may be edited')
+    if java and not ((name.startswith(JAVA_ROOTS) and name.endswith('.java')) or
+                     (name.startswith(RESOURCE_ROOTS) and name.endswith(('.html', '.css')))):
+        fail('Only Java source/tests and HTML/CSS application resources may be edited')
     current = root
     for part in path.parts:
         current = current / part
@@ -341,8 +343,10 @@ class Runner:
         with self.locked():
             existing = self.load(workspace_id + '.json')
             if existing:
-                self.workspace_meta(workspace_id)
-                return {'workspace_id': workspace_id, 'base_commit': existing['base_commit']}
+                path, existing = self.workspace_meta(workspace_id)
+                self.inherit_active_release(path, existing)
+                return {'workspace_id': workspace_id, 'base_commit': existing['base_commit'],
+                        'inherited_patch_sha': existing.get('parent_patch_sha', '')}
             base = self.head()
             if data.get('base_commit') not in (None, base):
                 fail('Requested revision is not the current HEAD', 409)
@@ -359,9 +363,53 @@ class Runner:
                         'exception_type': bounded(data.get('exception_type', ''), 256),
                         'fingerprint': bounded(data.get('fingerprint', ''), 128),
                         'incident_service': bounded(data.get('service', ''), 100),
-                        'incident_version': bounded(data.get('version', ''), 512), 'tests': None}
+                         'incident_version': bounded(data.get('version', ''), 512), 'tests': None}
             self.save(workspace_id + '.json', metadata)
-            return {'workspace_id': workspace_id, 'base_commit': base}
+            self.inherit_active_release(path, metadata)
+            return {'workspace_id': workspace_id, 'base_commit': base,
+                    'inherited_patch_sha': metadata.get('parent_patch_sha', '')}
+
+    def inherit_active_release(self, path, meta):
+        """Carry the verified release into a cumulative, fully displayed diff.
+
+        Never overwrite user edits, mutate source HEAD, or silently accept drift.
+        An existing workspace may acquire a non-conflicting parent on continuation;
+        switching between two already-patched parents requires a new workspace.
+        Caller holds the runner lock.
+        """
+        active = self.load('active.json')
+        if not active:
+            return
+        try:
+            current = self.ops.current()
+        except RuntimeError:
+            # Offline preparation is allowed; deploy still independently requires
+            # a running, provenance-checked and healthy previous release.
+            current = None
+        if current and current['image'] != active['image']:
+            fail('Running image changed outside the deployment journal', 409)
+        if active['base_commit'] != meta['base_commit']:
+            self.check_integrated_base(active, meta['base_commit'])
+            return
+        if meta.get('parent_patch_sha') == active['patch_sha']:
+            return
+        if meta.get('parent_patch_sha'):
+            fail('Workspace parent release changed; prepare a new fix', 409)
+        patch = active.get('patch', '')
+        if not patch or hashlib.sha256(patch.encode()).hexdigest() != active['patch_sha']:
+            fail('Active release patch cannot be verified', 409)
+        # Validate retained work BEFORE touching it. git apply is all-or-nothing
+        # without --reject; --check detects overlaps without losing any edits.
+        self.diff(path, meta)
+        with tempfile.NamedTemporaryFile(mode='w', dir=self.state) as target:
+            target.write(patch)
+            target.flush()
+            check = self.command(['git', '-C', str(path), 'apply', '--check', target.name])
+            if check['returncode']:
+                fail('Retained edits conflict with active release; prepare a new fix', 409)
+            self.git(path, 'apply', target.name)
+        meta.update(parent_patch_sha=active['patch_sha'], base_image=active['image'], tests=None)
+        self.save(meta['workspace_id'] + '.json', meta)
 
     def workspace_meta(self, workspace_id):
         if not isinstance(workspace_id, str) or not re.fullmatch(r'job-[1-9][0-9]{0,17}', workspace_id):
@@ -376,7 +424,7 @@ class Runner:
         return path, meta
 
     def diff(self, path, meta):
-        # Include untracked Java files without committing or staging their contents.
+        # Include untracked editable files without committing their contents.
         untracked = self.git(path, 'ls-files', '--others', '--exclude-standard', '-z').split('\0')
         for name in filter(None, untracked):
             safe_path(path, name, java=True)
@@ -390,11 +438,11 @@ class Runner:
             # Renames, symlinks, executable mode changes and binary diffs are not fixes.
             mode = self.git(path, 'ls-files', '--stage', '--', name)
             if mode and not mode.startswith('100644 '):
-                fail('Only regular non-executable Java files are allowed', 409)
+                fail('Only regular non-executable source files are allowed', 409)
             candidate = safe_path(path, name, java=True)
             if candidate.exists() and (candidate.stat().st_size > FILE_LIMIT or
                                        candidate.stat().st_mode & 0o111 or b'\0' in candidate.read_bytes()):
-                fail('Java changes must be bounded text', 409)
+                fail('Source changes must be bounded text', 409)
         patch = self.git(path, 'diff', '--no-ext-diff', '--no-textconv', '--binary', '--no-renames',
                          meta['base_commit'], '--', limit=PATCH_LIMIT)
         return {'patch': patch, 'patch_sha': hashlib.sha256(patch.encode()).hexdigest(), 'changed_files': names}
@@ -619,7 +667,11 @@ class Runner:
             if pending and pending['status'] == 'ROLLBACK_FAILED':
                 fail('Previous deployment recovery failed; manual intervention required', 409)
             active = self.load('active.json')
-            self.check_integrated_base(active, meta['base_commit'])
+            if active and active['base_commit'] == meta['base_commit'] and meta.get('parent_patch_sha') == active['patch_sha']:
+                if diff['patch_sha'] == active['patch_sha']:
+                    fail('Patch contains no changes beyond the active release', 409)
+            else:
+                self.check_integrated_base(active, meta['base_commit'])
             previous = self.ops.current()
             if active and previous['image'] != active['image']:
                 fail('Running image changed outside the deployment journal', 409)

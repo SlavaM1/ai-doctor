@@ -31,6 +31,7 @@ class FakeDeployment:
         self.healthy = True
         self.rollback_healthy = True
         self.builds = []
+        self.patches = {}
 
     def current(self):
         return {'image': self.image, 'source_revision': self.revision, 'patch_sha': getattr(self, 'patch_sha', '')}
@@ -39,11 +40,14 @@ class FakeDeployment:
         self.builds.append((context / 'Dockerfile').read_text())
         assert not (context / '.git').exists()
         assert not (context / '.env').exists()
+        self.new = 'sha256:' + patch_sha
+        self.patches[self.new] = patch_sha
         return self.new
 
     def activate(self, image):
         self.activated.append(image)
         self.image = image
+        self.patch_sha = self.patches.get(image, '')
 
     def verify(self, metadata, since, rollback=False):
         return {'ok': self.rollback_healthy if rollback else self.healthy}
@@ -407,9 +411,8 @@ def test_stale_head_and_unintegrated_previous_patch_rejected(harness):
     (h.repo / 'README.md').write_text('advance without incorporating deployed fix')
     git(h.repo, 'add', 'README.md')
     git(h.repo, 'commit', '-qm', 'unintegrated version')
-    request = approved(h, job=3)
     with pytest.raises(HTTPException, match='previously deployed patch'):
-        h.runner.deploy(request)
+        approved(h, job=3)  # Reject before spending model calls/tests, not only at deploy.
     assert h.ops.activated == [h.ops.new]
 
 
@@ -662,7 +665,7 @@ async def test_agent_ready_only_after_fixed_validation_no_reasoning_events(fixin
     assert 'PRIVATE CHAIN OF THOUGHT' not in json.dumps(result['events'])
     assert not h.runner.ops.activated
     again = await h.fixing.prepare_fix(h.job_id)
-    assert again['status'] == 'READY' and count == 1  # No redundant LLM summary call.
+    assert again['status'] == 'READY' and count == 2  # A tool edit must be followed by completion.
 
 
 @pytest.mark.asyncio
@@ -786,6 +789,9 @@ async def test_json_patch_tests_fail_then_agent_reads_and_repairs_in_same_worksp
             assert kind == 'fix_patch' and tools is None
             return {'choices': [{'message': {'content': json.dumps({'summary': 'Первый patch',
                 'changes': [{'path': JAVA, 'old': '"bad"', 'new': '"broken"'}]})}}]}
+        if calls == 6:
+            assert 'Tests passed' in json.dumps(messages)
+            return {'choices': [{'message': {'content': 'Все правки завершены, проверки пройдены.'}}]}
         assert 'package jakarta.servlet does not exist' in json.dumps(messages)
         assert {'file_read', 'file_search', 'file_apply_patch', 'run_allowed_tests'} <= {t['function']['name'] for t in tools}
         if calls == 4:
@@ -796,7 +802,7 @@ async def test_json_patch_tests_fail_then_agent_reads_and_repairs_in_same_worksp
 
     monkeypatch.setattr(h.fixing, 'llm_call', llm)
     result = await h.fixing.prepare_fix(h.job_id)
-    assert result['status'] == 'READY' and calls == 5
+    assert result['status'] == 'READY' and calls == 6
     assert result['tests']['passed'] and result['tests']['patch_sha'] == result['patch_sha']
     validations = [e for e in result['events'] if e['kind'] == 'validation']
     assert [e['data']['tests']['passed'] for e in validations] == [False, True]
@@ -807,6 +813,7 @@ async def test_json_patch_tests_fail_then_agent_reads_and_repairs_in_same_worksp
 async def test_continuation_gets_retained_patch_and_failure_and_preserves_budget(fixing_harness, monkeypatch):
     from doctor.db import AgentRun, FixJob
     h = fixing_harness
+    h.settings.max_agent_iterations = 3
     ws = workspace(h.runner)
     edit(h.runner, ws)
     h.runner.test_result.update(returncode=1, output='[ERROR] expected: <good> but was: <bad>')
@@ -818,6 +825,9 @@ async def test_continuation_gets_retained_patch_and_failure_and_preserves_budget
 
     async def llm(messages, *args, **kwargs):
         content = json.dumps(messages)
+        if 'better' in (h.runner.runner.root / ws / JAVA).read_text():
+            assert 'Passed' in content
+            return {'choices': [{'message': {'content': 'Исправление завершено.'}}]}
         assert 'retained_workspace' in content and 'expected:' in content and 'good' in content
         h.runner.test_result.update(returncode=0, output='Passed')
         return tool_response('file_apply_patch', {'path': JAVA, 'replacements': [{'old': '"good"', 'new': '"better"'}]})
@@ -841,7 +851,7 @@ async def test_upfront_authorized_deploy_queued_only_for_trusted_passing_patch(f
     async def llm(*args, **kwargs):
         if not h.runner.runner.load('job-1.json') or not (h.runner.runner.root / 'job-1' / JAVA).read_text().count('"good"'):
             return tool_response('file_apply_patch', {'path': JAVA, 'replacements': [{'old': '"bad"', 'new': '"good"'}]})
-        return tool_response('git_status')
+        return {'choices': [{'message': {'content': 'Исправление завершено.'}}]}
 
     monkeypatch.setattr(h.fixing, 'llm_call', llm)
     job = await h.fixing.prepare_fix(h.job_id)
@@ -891,8 +901,313 @@ def test_runner_validation_errors_are_actionable_but_arbitrary_bodies_are_not():
     from doctor.fixing import _error
     for detail, expected in [('Each old text must match exactly once', 'Each old text'),
                              ('File already exists', 'File already exists'),
+                             ('Running image changed outside the deployment journal', 'outside the deployment journal'),
+                             ('Source HEAD does not contain the previously deployed patch', 'previously deployed patch'),
+                             ('Source HEAD does not descend from the deployed base', 'does not descend'),
+                             ('Previous patch integration cannot be verified', 'integration cannot be verified'),
+                             ('Patched image has no trusted active journal; restore its journal or use a clean provenance-labelled baseline', 'no trusted active journal'),
+                             ('Previous deployment recovery failed; manual intervention required', 'recovery failed'),
                              ('password=super-secret Authorization: private', 'Runner HTTP 409')]:
         response = httpx.Response(409, json={'detail': detail}, request=httpx.Request('POST', 'http://runner/tool'))
         error = httpx.HTTPStatusError('never expose this', request=response.request, response=response)
         result = _error(error)
         assert expected in result and 'super-secret' not in result and 'private' not in result
+
+
+def test_sequential_releases_inherit_active_patch_without_changing_source(harness):
+    h = harness
+    first = approved(h)
+    assert h.runner.deploy(first)['status'] == 'SUCCEEDED'
+    source_head = h.runner.head()
+    second = h.runner.workspace({'job_id': 2})
+    assert second['inherited_patch_sha'] == first['patch_sha']
+    path, meta = h.runner.workspace_meta(second['workspace_id'])
+    assert '"good"' in (path / JAVA).read_text()
+    h.runner.tool({'workspace_id': second['workspace_id'], 'action': 'run_allowed_tests'})
+    with pytest.raises(HTTPException, match='no changes beyond'):
+        h.runner.deploy({**second, 'confirmed': True, 'patch_sha': first['patch_sha']})
+    h.runner.tool({'workspace_id': second['workspace_id'], 'action': 'file_apply_patch', 'path': JAVA,
+                   'replacements': [{'old': '"good"', 'new': '"better"'}]})
+    tests = h.runner.tool({'workspace_id': second['workspace_id'], 'action': 'run_allowed_tests'})
+    result = h.runner.deploy({**second, 'confirmed': True, 'patch_sha': tests['patch_sha']})
+    assert result['status'] == 'SUCCEEDED'
+    assert result['previous_active']['patch_sha'] == first['patch_sha']
+    assert h.runner.head() == source_head and git(h.repo, 'status', '--porcelain') == ''
+    assert '"bad"' in (h.repo / JAVA).read_text()
+
+
+def test_failed_followup_release_rolls_back_to_previous_patch_not_baseline(harness):
+    h = harness
+    first = approved(h)
+    h.runner.deploy(first)
+    previous = h.runner.load('active.json')
+    second = h.runner.workspace({'job_id': 2})
+    h.runner.tool({'workspace_id': second['workspace_id'], 'action': 'file_apply_patch', 'path': JAVA,
+                   'replacements': [{'old': '"good"', 'new': '"broken-release"'}]})
+    tests = h.runner.tool({'workspace_id': second['workspace_id'], 'action': 'run_allowed_tests'})
+    h.ops.healthy = False
+    result = h.runner.deploy({**second, 'confirmed': True, 'patch_sha': tests['patch_sha']})
+    assert result['status'] == 'ROLLED_BACK'
+    assert h.ops.current()['image'] == previous['image'] != h.ops.old
+    assert h.ops.current()['patch_sha'] == previous['patch_sha']
+    assert h.runner.load('active.json') == previous
+
+
+def test_continuation_inherits_parent_preserving_nonconflicting_edits_and_invalidates_tests(harness):
+    h = harness
+    retained = workspace(h, 2)
+    h.runner.tool({'workspace_id': retained, 'action': 'file_create', 'path': TEST, 'content': 'class ExampleTest {}'})
+    h.runner.tool({'workspace_id': retained, 'action': 'run_allowed_tests'})
+    h.runner.deploy(approved(h))
+    result = h.runner.workspace({'job_id': 2})
+    path, meta = h.runner.workspace_meta(retained)
+    assert meta['tests'] is None and result['inherited_patch_sha']
+    assert (path / TEST).read_text() == 'class ExampleTest {}'
+    assert '"good"' in (path / JAVA).read_text()
+    assert h.runner.workspace({'job_id': 2}) == result  # Idempotent; no duplicate apply.
+
+
+def test_parent_conflicts_and_image_drift_do_not_overwrite_retained_work(harness):
+    h = harness
+    retained = workspace(h, 2)
+    edit(h, retained)
+    before = h.runner.tool({'workspace_id': retained, 'action': 'git_diff'})
+    h.runner.deploy(approved(h))
+    with pytest.raises(HTTPException, match='Retained edits conflict'):
+        h.runner.workspace({'job_id': 2})
+    assert h.runner.tool({'workspace_id': retained, 'action': 'git_diff'}) == before
+    h.ops.image = h.ops.old
+    with pytest.raises(HTTPException, match='outside the deployment journal'):
+        h.runner.workspace({'job_id': 3})
+    assert h.runner.tool({'workspace_id': retained, 'action': 'git_diff'}) == before
+
+
+def test_offline_preparation_inherits_release_but_cannot_deploy(harness, monkeypatch):
+    h = harness
+    first = approved(h)
+    h.runner.deploy(first)
+
+    def unavailable():
+        raise RuntimeError('Expected exactly one running configured Compose service')
+
+    monkeypatch.setattr(h.ops, 'current', unavailable)
+    second = h.runner.workspace({'job_id': 2})
+    path, meta = h.runner.workspace_meta(second['workspace_id'])
+    assert '"good"' in (path / JAVA).read_text()
+    assert meta['base_image'] == h.ops.new
+    h.runner.tool({'workspace_id': second['workspace_id'], 'action': 'file_apply_patch', 'path': JAVA,
+                   'replacements': [{'old': '"good"', 'new': '"offline-fixed"'}]})
+    tests = h.runner.tool({'workspace_id': second['workspace_id'], 'action': 'run_allowed_tests'})
+    activated = list(h.ops.activated)
+    with pytest.raises(RuntimeError, match='Expected exactly one'):
+        h.runner.deploy({**second, 'confirmed': True, 'patch_sha': tests['patch_sha']})
+    assert h.ops.activated == activated
+
+
+def test_changed_parent_release_requires_new_workspace_and_keeps_edits(harness):
+    h = harness
+    h.runner.deploy(approved(h))
+    retained = h.runner.workspace({'job_id': 2})
+    other = h.runner.workspace({'job_id': 3})
+    h.runner.tool({'workspace_id': other['workspace_id'], 'action': 'file_apply_patch', 'path': JAVA,
+                   'replacements': [{'old': '"good"', 'new': '"new-release"'}]})
+    tests = h.runner.tool({'workspace_id': other['workspace_id'], 'action': 'run_allowed_tests'})
+    h.runner.deploy({**other, 'confirmed': True, 'patch_sha': tests['patch_sha']})
+    path, meta = h.runner.workspace_meta(retained['workspace_id'])
+    before = h.runner.diff(path, meta)
+    with pytest.raises(HTTPException, match='Workspace parent release changed'):
+        h.runner.workspace({'job_id': 2})
+    assert h.runner.diff(path, meta) == before
+    fresh = h.runner.workspace({'job_id': 4})
+    fresh_path, _ = h.runner.workspace_meta(fresh['workspace_id'])
+    assert '"new-release"' in (fresh_path / JAVA).read_text()
+
+
+@pytest.mark.parametrize('name', ['src/main/resources/templates/error.html', 'src/main/resources/static/css/error.css'])
+def test_agent_can_edit_page_resources_and_tests_are_invalidated(harness, name):
+    h = harness
+    ws = workspace(h)
+    h.runner.tool({'workspace_id': ws, 'action': 'run_allowed_tests'})
+    h.runner.tool({'workspace_id': ws, 'action': 'file_create', 'path': name, 'content': 'safe page'})
+    path, meta = h.runner.workspace_meta(ws)
+    assert meta['tests'] is None
+    diff = h.runner.tool({'workspace_id': ws, 'action': 'git_diff'})
+    assert diff['changed_files'] == [name]
+    with h.runner.snapshot(path) as snapshot:
+        assert (snapshot / name).read_text() == 'safe page'
+
+
+@pytest.mark.parametrize('name', ['src/main/resources/application.yml', 'src/main/resources/templates/x.java',
+                                 'src/main/resources/static/config.json', 'src/main/resources/static/.env.html',
+                                 'src/main/resources/templates/../../pom.xml', 'src/main/resources/db/migrations/x.html'])
+def test_resource_permission_does_not_allow_configuration_or_path_escape(harness, name):
+    with pytest.raises(HTTPException):
+        harness.runner.tool({'workspace_id': workspace(harness), 'action': 'file_create', 'path': name, 'content': 'bad'})
+
+
+@pytest.mark.asyncio
+async def test_inherited_patch_alone_cannot_complete_new_task(fixing_harness, monkeypatch):
+    h = fixing_harness
+    h.runner.runner.deploy(approved(h.runner, 99))
+
+    async def llm(*args, **kwargs):
+        return tool_response('git_status')
+
+    monkeypatch.setattr(h.fixing, 'llm_call', llm)
+    result = await h.fixing.prepare_fix(h.job_id)
+    assert result['status'] == 'BUDGET_EXHAUSTED'
+    assert result['tests']['passed']
+    assert result['patch_sha'] == h.runner.runner.load('active.json')['patch_sha']
+
+
+@pytest.mark.asyncio
+async def test_deploy_rejection_exposes_safe_reason_without_unknown_state_claim(fixing_harness, monkeypatch):
+    from doctor.db import Deployment, FixJob
+    h = fixing_harness
+    with h.sessions.begin() as session:
+        job = session.get(FixJob, h.job_id)
+        job.status, job.workspace, job.patch_sha = 'READY', 'job-1', 'a' * 64
+        deployment = Deployment(fix_job_id=job.id)
+        session.add(deployment)
+        session.flush()
+        deployment_id = deployment.id
+
+    async def rejected(*args, **kwargs):
+        response = httpx.Response(409, json={'detail': 'Running image changed outside the deployment journal'},
+                                  request=httpx.Request('POST', 'http://runner/deploy'))
+        response.raise_for_status()
+
+    monkeypatch.setattr(h.fixing, 'runner_call', rejected)
+    result = await h.fixing.deploy_fix(deployment_id)
+    assert result['result']['recovery_required'] is False
+    assert 'outside the deployment journal' in result['result']['error']
+    with h.sessions() as session:
+        error = session.get(FixJob, h.job_id).error
+    assert 'outside the deployment journal' in error and 'Завершение не подтверждено' not in error
+
+
+@pytest.mark.asyncio
+async def test_passing_first_edit_does_not_finish_multifile_task(fixing_harness, monkeypatch):
+    h = fixing_harness
+    h.settings.max_agent_iterations = 4
+    calls = 0
+
+    async def llm(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return tool_response('file_apply_patch', {'path': JAVA, 'replacements': [{'old': '"bad"', 'new': '"good"'}]})
+        if calls == 2:
+            return tool_response('file_create', {'path': 'src/main/resources/templates/error.html', 'content': '<html>Ошибка</html>'})
+        return {'choices': [{'message': {'content': 'Обработчик и HTML-страница готовы.'}}]}
+
+    monkeypatch.setattr(h.fixing, 'llm_call', llm)
+    result = await h.fixing.prepare_fix(h.job_id)
+    assert calls == 3 and result['status'] == 'READY'
+    assert len(result['changed_files']) == 2
+    assert len([e for e in result['events'] if e['kind'] == 'validation']) == 2
+
+
+@pytest.mark.asyncio
+async def test_passing_partial_patch_at_budget_limit_is_not_deployable(fixing_harness, monkeypatch):
+    h = fixing_harness
+    h.settings.max_agent_iterations = 1
+
+    async def llm(*args, **kwargs):
+        return tool_response('file_apply_patch', {'path': JAVA, 'replacements': [{'old': '"bad"', 'new': '"good"'}]})
+
+    monkeypatch.setattr(h.fixing, 'llm_call', llm)
+    result = await h.fixing.prepare_fix(h.job_id)
+    assert result['status'] == 'BUDGET_EXHAUSTED' and result['tests']['passed']
+
+
+@pytest.mark.asyncio
+async def test_reading_retained_passing_patch_does_not_skip_remaining_work(fixing_harness, monkeypatch):
+    h = fixing_harness
+    h.settings.max_agent_iterations = 4
+    ws = workspace(h.runner)
+    edit(h.runner, ws)
+    h.runner.runner.tool({'workspace_id': ws, 'action': 'run_allowed_tests'})
+    calls = 0
+
+    async def llm(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return tool_response('file_read', {'path': JAVA})
+        if calls == 2:
+            return tool_response('file_apply_patch', {'path': JAVA, 'replacements': [{'old': '"good"', 'new': '"complete"'}]})
+        return {'choices': [{'message': {'content': 'Оставшиеся правки завершены.'}}]}
+
+    monkeypatch.setattr(h.fixing, 'llm_call', llm)
+    result = await h.fixing.prepare_fix(h.job_id)
+    assert calls == 3 and result['status'] == 'READY' and 'complete' in result['patch']
+
+
+@pytest.mark.asyncio
+async def test_repair_reads_remain_available_after_multiple_stagnant_turns(fixing_harness, monkeypatch):
+    h = fixing_harness
+    h.settings.max_agent_iterations = 7
+    calls = 0
+
+    async def llm(*args, tools=None, **kwargs):
+        nonlocal calls
+        calls += 1
+        assert tools is not None, 'Repair must not be trapped in forced JSON without source tools'
+        if calls == 1:
+            h.runner.test_result.update(returncode=1, output='[ERROR] current patch failed')
+            return tool_response('file_apply_patch', {'path': JAVA, 'replacements': [{'old': '"bad"', 'new': '"broken"'}]})
+        if calls <= 4:
+            return tool_response('file_read', {'path': JAVA})
+        if calls == 5:
+            h.runner.test_result.update(returncode=0, output='Tests passed')
+            return tool_response('file_apply_patch', {'path': JAVA, 'replacements': [{'old': '"broken"', 'new': '"complete"'}]})
+        return {'choices': [{'message': {'content': 'Исправление завершено.'}}]}
+
+    monkeypatch.setattr(h.fixing, 'llm_call', llm)
+    result = await h.fixing.prepare_fix(h.job_id)
+    assert result['status'] == 'READY' and calls == 6
+
+
+@pytest.mark.asyncio
+async def test_invalid_json_bootstrap_yields_back_to_source_tools(fixing_harness, monkeypatch):
+    h = fixing_harness
+    h.settings.max_agent_iterations = 6
+    calls = 0
+
+    async def llm(*args, tools=None, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            assert tools is None
+            return {'choices': [{'message': {'content': 'not valid JSON'}}]}
+        assert tools is not None
+        if calls <= 2:
+            return tool_response('file_read', {'path': JAVA})
+        if calls == 4:
+            return tool_response('file_apply_patch', {'path': JAVA, 'replacements': [{'old': '"bad"', 'new': '"complete"'}]})
+        return {'choices': [{'message': {'content': 'Исправление завершено.'}}]}
+
+    monkeypatch.setattr(h.fixing, 'llm_call', llm)
+    result = await h.fixing.prepare_fix(h.job_id)
+    assert result['status'] == 'READY' and calls == 5
+
+
+def test_context_keeps_latest_requested_source_and_pinned_compiler_failure():
+    from doctor.fixing import SYSTEM, TOOLS, _current_checks, _fit_messages
+    settings = SimpleNamespace(max_context_tokens=18000, max_output_tokens=3000)
+    failure = _current_checks({'passed': False, 'patch_sha': 'a' * 64,
+                               'output': '[ERROR] UNIQUE_COMPILER_FAILURE missing HTML\n' + 'Maven noise\n' * 1500})
+    source = 'public static final String UNIQUE_REQUESTED_SOURCE = "value";\n' + 'source line\n' * 100
+    call = {'role': 'assistant', 'tool_calls': [{'id': 'read', 'type': 'function',
+            'function': {'name': 'file_read', 'arguments': json.dumps({'path': JAVA})}}]}
+    turns = [[{'role': 'user', 'content': 'old evidence' * 5000}],
+             [call, {'role': 'tool', 'tool_call_id': 'read', 'content': source}]]
+    initial = [{'role': 'system', 'content': SYSTEM},
+               {'role': 'user', 'content': json.dumps({'goal': 'Согласуй error-ответы. ' * 30, 'evidence': 'logs' * 4000})},
+               {'role': 'user', 'content': json.dumps({'tests': failure})}]
+    fitted = _fit_messages(initial, turns, TOOLS, settings)
+    text = json.dumps(fitted)
+    assert 'UNIQUE_REQUESTED_SOURCE' in text and 'UNIQUE_COMPILER_FAILURE' in text
+    assert any(message.get('tool_call_id') == 'read' for message in fitted)
+    assert any(message.get('tool_calls') for message in fitted)

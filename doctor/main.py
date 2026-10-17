@@ -477,7 +477,7 @@ async def fix(incident_id: int, body: FixRequest):
 
 @app.get('/fixes/{job_id}')
 def fix_detail(job_id: int):
-    from .fixing import job_runs, iteration_limit, policy
+    from .fixing import job_runs, iteration_limit, policy, requires_new_workspace, MAX_TOOL_CALLS
     with Session() as session:
         job = session.get(FixJob, job_id)
         if not job:
@@ -486,7 +486,14 @@ def fix_detail(job_id: int):
         usage = {key: sum(getattr(run, key) for run in runs) for key in ('input_tokens', 'output_tokens', 'total_tokens', 'calls', 'latency_ms')}
         usage['approximate'] = any(run.approximate for run in runs)
         superseded = bool(session.scalar(select(FixJob.id).where(FixJob.incident_id == job.incident_id, FixJob.id > job.id).limit(1)))
+        latest_deployment = session.scalars(select(Deployment).where(Deployment.fix_job_id == job_id)
+                                            .order_by(Deployment.id.desc()).limit(1)).first()
+        tool_state = session.get(State, f'fix-tools:{job_id}')
+        tool_calls = tool_state.value.get('calls', 0) if tool_state else 0
         return {**serialize(job), 'auto_deploy': policy(job_id, session).get('auto_deploy', False),
+                'deployment': serialize(latest_deployment) if latest_deployment else None,
+                'new_workspace_required': requires_new_workspace(job),
+                'tool_calls_used': tool_calls, 'remaining_tool_calls': max(0, MAX_TOOL_CALLS - tool_calls),
                 'calls_used': usage['calls'], 'remaining_calls': 0 if superseded else max(0, iteration_limit(get_settings()) - usage['calls']), 'superseded': superseded, 'usage': usage}
 
 
@@ -498,7 +505,7 @@ class ContinueFixRequest(BaseModel):
 
 @app.post('/fixes/{job_id}/continue')
 async def continue_fix(job_id: int, body: ContinueFixRequest = ContinueFixRequest()):
-    from .fixing import used_calls, iteration_limit, MAX_TOOL_CALLS
+    from .fixing import used_calls, iteration_limit, MAX_TOOL_CALLS, requires_new_workspace
     if body.auto_deploy is True and not body.confirmed:
         raise HTTPException(403, 'Подтвердите автоматическое развёртывание после успешных проверок')
     with incident_control_session() as session:
@@ -509,6 +516,8 @@ async def continue_fix(job_id: int, body: ContinueFixRequest = ContinueFixReques
             raise HTTPException(409, 'Сначала измените статус «Не требует решения»')
         if job.status not in {'FAILED', 'BUDGET_EXHAUSTED', 'INTERRUPTED'}:
             raise HTTPException(409, 'Only stopped jobs may be explicitly continued')
+        if requires_new_workspace(job):
+            raise HTTPException(409, 'Рабочая область устарела или конфликтует с текущим релизом. Подготовьте новое исправление.')
         if session.scalar(select(FixJob.id).where(FixJob.incident_id == job.incident_id, FixJob.id > job.id).limit(1)):
             raise HTTPException(409, 'Superseded jobs cannot be continued; use the latest job without resetting its budget')
         spent = used_calls(job_id, session)

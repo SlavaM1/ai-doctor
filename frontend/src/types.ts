@@ -44,7 +44,12 @@ export interface FixJob {
   error: string
   calls_used?: number
   auto_deploy?: boolean
+  deployment?: Deployment | null
+  new_workspace_required?: boolean
+  superseded?: boolean
   remaining_calls?: number
+  tool_calls_used?: number
+  remaining_tool_calls?: number
   usage?: { input_tokens: number; output_tokens: number; total_tokens: number; calls: number; latency_ms: number; approximate: boolean }
 }
 

@@ -1,0 +1,548 @@
+diff --git a/src/main/java/com/example/InternetStore/controller/GlobalExceptionHandler.java b/src/main/java/com/example/InternetStore/controller/GlobalExceptionHandler.java
+new file mode 100644
+index 0000000..c98d7e9
+--- /dev/null
++++ b/src/main/java/com/example/InternetStore/controller/GlobalExceptionHandler.java
+@@ -0,0 +1,50 @@
++package com.example.InternetStore.controller;
++
++import com.example.InternetStore.utils.error.ErrorHtmlRenderer;
++import java.nio.charset.StandardCharsets;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.http.HttpStatus;
++import org.springframework.http.MediaType;
++import org.springframework.http.ResponseEntity;
++import org.springframework.web.bind.annotation.ControllerAdvice;
++import org.springframework.web.bind.annotation.ExceptionHandler;
++import org.springframework.web.servlet.ModelAndView;
++
++import javax.servlet.http.HttpServletRequest;
++import javax.servlet.http.HttpServletResponse;
++import java.io.IOException;
++
++/**
++ * Глобальный обработчик ошибок: рендерит простую HTML-страницу напрямую,
++ * чтобы не зависеть от наличия шаблона Thymeleaf "error".
++ */
++@ControllerAdvice
++public class GlobalExceptionHandler {
++
++    private static final Logger log = LoggerFactory.getLogger(GlobalExceptionHandler.class);
++
++    static final String FALLBACK_HTML = ErrorHtmlRenderer.renderErrorPage();
++
++    @ExceptionHandler(Exception.class)
++    public ModelAndView handleAnyException(Exception ex, HttpServletRequest request, HttpServletResponse response) throws IOException {
++        HttpStatus status = ErrorHtmlRenderer.statusFor(ex);
++        if (!response.isCommitted() && ex instanceof org.springframework.web.HttpRequestMethodNotSupportedException) {
++            String[] supported = ((org.springframework.web.HttpRequestMethodNotSupportedException) ex).getSupportedMethods();
++            if (supported != null) {
++                response.setHeader("Allow", String.join(", ", supported));
++            }
++        }
++        if (status.is5xxServerError()) {
++            log.error("Unhandled request exception; returning safe HTML", ex);
++        }
++        ErrorHtmlRenderer.write(response, status);
++        return null;
++    }
++
++    static ResponseEntity<String> buildFallbackResponse() {
++        return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
++                .contentType(new MediaType(MediaType.TEXT_HTML, StandardCharsets.UTF_8))
++                .body(FALLBACK_HTML);
++    }
++}
+diff --git a/src/main/java/com/example/InternetStore/utils/error/ErrorHtmlRenderer.java b/src/main/java/com/example/InternetStore/utils/error/ErrorHtmlRenderer.java
+new file mode 100644
+index 0000000..a527d34
+--- /dev/null
++++ b/src/main/java/com/example/InternetStore/utils/error/ErrorHtmlRenderer.java
+@@ -0,0 +1,136 @@
++package com.example.InternetStore.utils.error;
++
++import java.io.IOException;
++import java.nio.charset.StandardCharsets;
++import java.util.ArrayList;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Locale;
++import java.util.Map;
++import javax.servlet.http.HttpServletResponse;
++import org.springframework.core.annotation.AnnotatedElementUtils;
++import org.springframework.http.HttpStatus;
++import org.springframework.web.bind.annotation.ResponseStatus;
++import org.springframework.web.server.ResponseStatusException;
++
++/** Self-contained error view: no template engine, database or external assets. */
++public final class ErrorHtmlRenderer {
++    public static final String MESSAGE = "произошла ошибка, обратитесь к администратору сайта";
++    private static final String HTML = """
++            <!doctype html>
++            <html lang="ru">
++            <head>
++              <meta charset="utf-8">
++              <meta name="viewport" content="width=device-width, initial-scale=1">
++              <title>Произошла ошибка — АурельSpa</title>
++              <style>
++                *{box-sizing:border-box}
++                body{margin:0;background:#fffaff;color:#342c40;font:17px/1.65 Arial,sans-serif}
++                main{min-height:100vh;min-height:100svh;display:grid;place-content:center;
++                  max-width:760px;margin:auto;padding:48px 24px;text-align:center}
++                .brand{font:32px Georgia,serif;letter-spacing:.02em;color:inherit;text-decoration:none}
++                .bloom{width:104px;height:104px;margin:44px auto 30px;color:#9d8ccd}
++                h1{margin:0 0 18px;font:clamp(32px,6vw,48px)/1.15 Georgia,serif;font-weight:400}
++                p{max-width:39ch;margin:0 auto 32px;color:#62576b;overflow-wrap:break-word}
++                .home{display:inline-block;justify-self:center;padding:13px 28px;border-radius:25px;
++                  background:linear-gradient(100deg,#acaaff,#fbbaf8);color:#342c40;
++                  text-decoration:none;font-size:15px;font-weight:bold}
++                a:focus-visible{outline:3px solid #6d5689;outline-offset:5px}
++                .home:hover{background:#e3cefa}
++                footer{margin-top:56px;color:#766780;font-size:13px}
++              </style>
++            </head>
++            <body>
++              <main>
++                <a class="brand" href="/" aria-label="АурельSpa — на главную">AurelSpa</a>
++                <svg class="bloom" viewBox="0 0 104 104" fill="none" aria-hidden="true">
++                  <path d="M52 85C22 72 14 43 20 24c17 1 29 12 32 28 3-16 15-27 32-28 6 19-2 48-32 61Z"
++                    stroke="currentColor" stroke-width="1.5"/>
++                  <path d="M52 85C33 65 32 37 52 12c20 25 19 53 0 73Z"
++                    fill="#f3e5fa" stroke="currentColor" stroke-width="1.5"/>
++                  <path d="M52 85V43" stroke="currentColor" stroke-width="1.5"/>
++                </svg>
++                <h1>Произошла ошибка</h1>
++                <p>произошла ошибка, обратитесь к администратору сайта</p>
++                <a class="home" href="/">Вернуться на главную</a>
++                <footer>АурельSpa · территория оздоровления и косметологии</footer>
++              </main>
++            </body>
++            </html>
++            """;
++
++    private ErrorHtmlRenderer() {}
++
++    public static String renderErrorPage() {
++        return HTML;
++    }
++
++    public static HttpStatus statusFor(Exception exception) {
++        if (exception instanceof org.springframework.web.HttpRequestMethodNotSupportedException) {
++            return HttpStatus.METHOD_NOT_ALLOWED;
++        }
++        if (exception instanceof org.springframework.web.HttpMediaTypeNotSupportedException) {
++            return HttpStatus.UNSUPPORTED_MEDIA_TYPE;
++        }
++        if (exception instanceof org.springframework.web.HttpMediaTypeNotAcceptableException) {
++            return HttpStatus.NOT_ACCEPTABLE;
++        }
++        if (exception instanceof org.springframework.web.servlet.NoHandlerFoundException) {
++            return HttpStatus.NOT_FOUND;
++        }
++        if (exception instanceof org.springframework.web.context.request.async.AsyncRequestTimeoutException) {
++            return HttpStatus.SERVICE_UNAVAILABLE;
++        }
++        if (exception instanceof org.springframework.web.multipart.MaxUploadSizeExceededException) {
++            return HttpStatus.PAYLOAD_TOO_LARGE;
++        }
++        if (exception instanceof org.springframework.security.access.AccessDeniedException) {
++            return HttpStatus.FORBIDDEN;
++        }
++        // These failures are server-side, despite being binding/type exceptions.
++        if (exception instanceof org.springframework.beans.ConversionNotSupportedException
++                || exception instanceof org.springframework.web.bind.MissingPathVariableException) {
++            return HttpStatus.INTERNAL_SERVER_ERROR;
++        }
++        if (exception instanceof org.springframework.web.bind.ServletRequestBindingException
++                || exception instanceof org.springframework.beans.TypeMismatchException
++                || exception instanceof org.springframework.http.converter.HttpMessageNotReadableException
++                || exception instanceof org.springframework.validation.BindException
++                || exception instanceof org.springframework.web.multipart.support.MissingServletRequestPartException) {
++            return HttpStatus.BAD_REQUEST;
++        }
++        if (exception instanceof ResponseStatusException) {
++            return errorStatus(((ResponseStatusException) exception).getStatus().value());
++        }
++        ResponseStatus annotation = AnnotatedElementUtils.findMergedAnnotation(exception.getClass(), ResponseStatus.class);
++        return annotation == null ? HttpStatus.INTERNAL_SERVER_ERROR : errorStatus(annotation.code().value());
++    }
++
++    public static HttpStatus errorStatus(int code) {
++        HttpStatus status = HttpStatus.resolve(code);
++        return code >= 400 && code <= 599 && status != null ? status : HttpStatus.INTERNAL_SERVER_ERROR;
++    }
++
++    public static void write(HttpServletResponse response, HttpStatus status) throws IOException {
++        if (response.isCommitted()) {
++            return;
++        }
++        // resetBuffer does not release an already acquired ISO-8859-1 writer.
++        // Reset its encoding too, preserving security/cookie/tracing headers but
++        // not headers describing the old, discarded representation.
++        Map<String, List<String>> headers = new LinkedHashMap<>();
++        for (String name : response.getHeaderNames()) {
++            String lower = name.toLowerCase(Locale.ROOT);
++            if (!List.of("content-type", "content-length", "content-encoding", "etag", "last-modified").contains(lower)) {
++                headers.put(name, new ArrayList<>(response.getHeaders(name)));
++            }
++        }
++        response.reset();
++        headers.forEach((name, values) -> values.forEach(value -> response.addHeader(name, value)));
++        response.setStatus(status.value());
++        response.setCharacterEncoding(StandardCharsets.UTF_8.name());
++        response.setContentType("text/html;charset=UTF-8");
++        response.setHeader("Cache-Control", "no-store");
++        response.getOutputStream().write(HTML.getBytes(StandardCharsets.UTF_8));
++    }
++}
+diff --git a/src/main/java/com/example/InternetStore/utils/error/SafeErrorController.java b/src/main/java/com/example/InternetStore/utils/error/SafeErrorController.java
+new file mode 100644
+index 0000000..024998d
+--- /dev/null
++++ b/src/main/java/com/example/InternetStore/utils/error/SafeErrorController.java
+@@ -0,0 +1,35 @@
++package com.example.InternetStore.utils.error;
++
++import org.springframework.boot.web.servlet.error.ErrorController;
++import org.springframework.http.HttpStatus;
++import java.io.IOException;
++import org.springframework.web.bind.annotation.RequestMapping;
++import org.springframework.web.bind.annotation.RestController;
++import org.springframework.web.server.ResponseStatusException;
++
++import javax.servlet.RequestDispatcher;
++import javax.servlet.http.HttpServletRequest;
++import javax.servlet.http.HttpServletResponse;
++
++@RestController
++public class SafeErrorController implements ErrorController {
++
++    static final String SAFE_MESSAGE = ErrorHtmlRenderer.renderErrorPage();
++
++    @RequestMapping("${server.error.path:${error.path:/error}}")
++    public void handleError(HttpServletRequest request, HttpServletResponse response) throws IOException {
++        ErrorHtmlRenderer.write(response, resolveStatus(request));
++    }
++
++    private HttpStatus resolveStatus(HttpServletRequest request) {
++        Object code = request.getAttribute(RequestDispatcher.ERROR_STATUS_CODE);
++        if (code instanceof Integer) {
++            return ErrorHtmlRenderer.errorStatus((Integer) code);
++        }
++        Object exception = request.getAttribute(RequestDispatcher.ERROR_EXCEPTION);
++        if (exception instanceof ResponseStatusException) {
++            return ErrorHtmlRenderer.errorStatus(((ResponseStatusException) exception).getStatus().value());
++        }
++        return HttpStatus.INTERNAL_SERVER_ERROR;
++    }
++}
+diff --git a/src/main/java/com/example/InternetStore/utils/error/SafeErrorHandler.java b/src/main/java/com/example/InternetStore/utils/error/SafeErrorHandler.java
+new file mode 100644
+index 0000000..0cf0cd8
+--- /dev/null
++++ b/src/main/java/com/example/InternetStore/utils/error/SafeErrorHandler.java
+@@ -0,0 +1,26 @@
++package com.example.InternetStore.utils.error;
++
++import java.io.IOException;
++
++import javax.servlet.http.HttpServletResponse;
++
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++/**
++ * Безопасная обработка необработанных исключений: отдаёт статический текст
++ * без использования Thymeleaf, чтобы исключить каскадную ошибку рендеринга
++ * шаблона error и утечку stack trace.
++ */
++// Compatibility helper only. GlobalExceptionHandler is the sole MVC advice.
++public class SafeErrorHandler {
++
++    private static final Logger log = LoggerFactory.getLogger(SafeErrorHandler.class);
++
++    public static final String FALLBACK_MESSAGE = ErrorHtmlRenderer.MESSAGE;
++
++    public void handleException(Exception ex, HttpServletResponse response) throws IOException {
++        log.error("Unhandled exception, returning safe error response", ex);
++        ErrorHtmlRenderer.write(response, ErrorHtmlRenderer.statusFor(ex));
++    }
++}
+diff --git a/src/test/java/com/example/InternetStore/controller/ErrorPageMvcRegressionTest.java b/src/test/java/com/example/InternetStore/controller/ErrorPageMvcRegressionTest.java
+new file mode 100644
+index 0000000..f09e2c6
+--- /dev/null
++++ b/src/test/java/com/example/InternetStore/controller/ErrorPageMvcRegressionTest.java
+@@ -0,0 +1,137 @@
++package com.example.InternetStore.controller;
++
++import com.example.InternetStore.utils.error.ErrorHtmlRenderer;
++import com.example.InternetStore.utils.error.SafeErrorController;
++import java.nio.charset.StandardCharsets;
++import javax.servlet.RequestDispatcher;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.springframework.http.HttpStatus;
++import org.springframework.http.MediaType;
++import org.springframework.stereotype.Controller;
++import org.springframework.test.web.servlet.MockMvc;
++import org.springframework.test.web.servlet.setup.MockMvcBuilders;
++import org.springframework.web.bind.annotation.GetMapping;
++import org.springframework.web.bind.annotation.PostMapping;
++import org.springframework.web.bind.annotation.RequestParam;
++import org.springframework.web.bind.annotation.ResponseBody;
++import org.springframework.web.server.ResponseStatusException;
++import static org.junit.jupiter.api.Assertions.*;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
++
++class ErrorPageMvcRegressionTest {
++    private MockMvc mvc;
++
++    @Controller
++    static class FailingController {
++        @GetMapping("/test-error")
++        public void error() { throw new NumberFormatException("secret-internal-value"); }
++
++        @GetMapping("/test-not-found")
++        public void notFound() { throw new ResponseStatusException(HttpStatus.NOT_FOUND, "secret-resource"); }
++
++        @PostMapping("/test-post-only")
++        @ResponseBody
++        public String postOnly() { return "ok"; }
++
++        @GetMapping("/test-required")
++        @ResponseBody
++        public String required(@RequestParam("id") int id) { return Integer.toString(id); }
++    }
++
++    @BeforeEach
++    void setup() {
++        mvc = MockMvcBuilders.standaloneSetup(new FailingController(), new SafeErrorController())
++                .setControllerAdvice(new GlobalExceptionHandler()).build();
++    }
++
++    @Test
++    void unhandledMvcExceptionReturnsStyledSafeUtf8Html() throws Exception {
++        String html = mvc.perform(get("/test-error"))
++                .andExpect(status().isInternalServerError())
++                .andExpect(content().contentTypeCompatibleWith(MediaType.TEXT_HTML))
++                .andExpect(header().string("Cache-Control", "no-store"))
++                .andReturn().getResponse().getContentAsString(StandardCharsets.UTF_8);
++        assertEquals(ErrorHtmlRenderer.renderErrorPage(), html);
++        assertTrue(html.contains(ErrorHtmlRenderer.MESSAGE));
++        assertTrue(html.contains("AurelSpa"));
++        assertTrue(html.contains("Вернуться на главную"));
++        assertFalse(html.contains("secret-internal-value"));
++        assertFalse(html.contains("NumberFormatException"));
++        assertFalse(html.contains("java.lang"));
++    }
++
++    @Test
++    void servletErrorUsesSameHtmlAndPreserves404And500() throws Exception {
++        for (int code : new int[]{404, 500}) {
++            mvc.perform(get("/error").requestAttr(RequestDispatcher.ERROR_STATUS_CODE, code)
++                            .requestAttr(RequestDispatcher.ERROR_EXCEPTION, new RuntimeException("secret-error")))
++                    .andExpect(status().is(code))
++                    .andExpect(content().contentTypeCompatibleWith(MediaType.TEXT_HTML))
++                    .andExpect(content().string(ErrorHtmlRenderer.renderErrorPage()));
++        }
++    }
++
++    @Test
++    void responseStatusExceptionPreserves404WithoutDetails() throws Exception {
++        mvc.perform(get("/test-not-found"))
++                .andExpect(status().isNotFound())
++                .andExpect(content().string(ErrorHtmlRenderer.renderErrorPage()));
++    }
++
++    @Test
++    void invalidErrorStatusCannotBecomeSuccess() throws Exception {
++        mvc.perform(get("/error").requestAttr(RequestDispatcher.ERROR_STATUS_CODE, 200))
++                .andExpect(status().isInternalServerError());
++    }
++
++    @Test
++    void mvcClientErrorsPreserve400And405() throws Exception {
++        mvc.perform(get("/test-post-only"))
++                .andExpect(status().isMethodNotAllowed())
++                .andExpect(header().string("Allow", "POST"))
++                .andExpect(content().string(ErrorHtmlRenderer.renderErrorPage()));
++        mvc.perform(get("/test-required"))
++                .andExpect(status().isBadRequest())
++                .andExpect(content().string(ErrorHtmlRenderer.renderErrorPage()));
++        mvc.perform(get("/test-required").param("id", "not-a-number"))
++                .andExpect(status().isBadRequest())
++                .andExpect(content().string(ErrorHtmlRenderer.renderErrorPage()));
++    }
++
++    @Test
++    void servletErrorResetsOldEncodingAndDoesNotAppendAfterCommit() throws Exception {
++        org.springframework.mock.web.MockHttpServletRequest request = new org.springframework.mock.web.MockHttpServletRequest();
++        request.setAttribute(RequestDispatcher.ERROR_STATUS_CODE, 500);
++        org.springframework.mock.web.MockHttpServletResponse response = new org.springframework.mock.web.MockHttpServletResponse();
++        response.setHeader("Content-Encoding", "gzip");
++        response.setHeader("X-Trace-Id", "servlet-trace");
++        response.getOutputStream().write(new byte[]{1, 2, 3});
++        new SafeErrorController().handleError(request, response);
++        assertNull(response.getHeader("Content-Encoding"));
++        assertEquals("servlet-trace", response.getHeader("X-Trace-Id"));
++        assertEquals(ErrorHtmlRenderer.renderErrorPage(), response.getContentAsString(StandardCharsets.UTF_8));
++        response.flushBuffer();
++        new SafeErrorController().handleError(request, response);
++        assertEquals(ErrorHtmlRenderer.renderErrorPage(), response.getContentAsString(StandardCharsets.UTF_8));
++    }
++
++    @Test
++    void rendererPreservesTracingHeaderAndDoesNotRewriteCommittedResponse() throws Exception {
++        org.springframework.mock.web.MockHttpServletResponse response = new org.springframework.mock.web.MockHttpServletResponse();
++        response.setHeader("X-Trace-Id", "test-trace");
++        response.setHeader("X-Content-Type-Options", "nosniff");
++        response.setContentLength(99999);
++        response.getWriter().write("old partial body");
++        ErrorHtmlRenderer.write(response, HttpStatus.INTERNAL_SERVER_ERROR);
++        assertEquals("test-trace", response.getHeader("X-Trace-Id"));
++        assertEquals("nosniff", response.getHeader("X-Content-Type-Options"));
++        assertNull(response.getHeader("Content-Length"));
++        assertEquals(ErrorHtmlRenderer.renderErrorPage(), response.getContentAsString());
++        response.flushBuffer();
++        ErrorHtmlRenderer.write(response, HttpStatus.NOT_FOUND);
++        assertEquals(500, response.getStatus());
++        assertEquals(ErrorHtmlRenderer.renderErrorPage(), response.getContentAsString());
++    }
++}
+diff --git a/src/test/java/com/example/InternetStore/controller/GlobalExceptionHandlerTest.java b/src/test/java/com/example/InternetStore/controller/GlobalExceptionHandlerTest.java
+new file mode 100644
+index 0000000..a5cd83f
+--- /dev/null
++++ b/src/test/java/com/example/InternetStore/controller/GlobalExceptionHandlerTest.java
+@@ -0,0 +1,43 @@
++package com.example.InternetStore.controller;
++
++import org.junit.jupiter.api.Test;
++import org.springframework.http.HttpStatus;
++import org.springframework.http.MediaType;
++import org.springframework.http.ResponseEntity;
++import org.springframework.mock.web.MockHttpServletRequest;
++import org.springframework.mock.web.MockHttpServletResponse;
++import java.nio.charset.StandardCharsets;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++class GlobalExceptionHandlerTest {
++
++    @Test
++    void handleWritesUserFriendlyHtmlAndReturns500() throws Exception {
++        GlobalExceptionHandler handler = new GlobalExceptionHandler();
++        MockHttpServletRequest request = new MockHttpServletRequest();
++        MockHttpServletResponse response = new MockHttpServletResponse();
++
++        assertNull(handler.handleAnyException(new RuntimeException("boom"), request, response));
++
++        assertEquals(HttpStatus.INTERNAL_SERVER_ERROR.value(), response.getStatus());
++        assertTrue(response.getContentType() != null && response.getContentType().startsWith(MediaType.TEXT_HTML_VALUE));
++        String body = response.getContentAsString();
++        assertNotNull(body);
++        assertTrue(body.contains("Произошла ошибка"));
++        assertTrue(body.contains("обратитесь к администратору сайта"));
++    }
++
++    @Test
++    void fallbackResponseIsHtmlWithMessage() {
++        ResponseEntity<String> response = GlobalExceptionHandler.buildFallbackResponse();
++        assertEquals(HttpStatus.INTERNAL_SERVER_ERROR, response.getStatusCode());
++        assertEquals(new MediaType(MediaType.TEXT_HTML, StandardCharsets.UTF_8), response.getHeaders().getContentType());
++        String body = response.getBody();
++        assertNotNull(body);
++        assertTrue(body.contains("обратитесь к администратору сайта"));
++    }
++}
+diff --git a/src/test/java/com/example/InternetStore/utils/error/SafeErrorControllerTest.java b/src/test/java/com/example/InternetStore/utils/error/SafeErrorControllerTest.java
+new file mode 100644
+index 0000000..35d29a1
+--- /dev/null
++++ b/src/test/java/com/example/InternetStore/utils/error/SafeErrorControllerTest.java
+@@ -0,0 +1,42 @@
++package com.example.InternetStore.utils.error;
++
++import org.junit.jupiter.api.Test;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
++import org.springframework.test.web.servlet.MockMvc;
++
++import javax.servlet.RequestDispatcher;
++
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
++
++class SafeErrorControllerTest {
++
++    private MockMvc mockMvc;
++
++    @org.junit.jupiter.api.BeforeEach
++    void setUp() {
++        mockMvc = org.springframework.test.web.servlet.setup.MockMvcBuilders
++                .standaloneSetup(new SafeErrorController())
++                .build();
++    }
++
++    @Test
++    void returns500WithSafeMessageOnServerError() throws Exception {
++        mockMvc.perform(get("/error")
++                        .requestAttr(RequestDispatcher.ERROR_STATUS_CODE, Integer.valueOf(500))
++                        .requestAttr(RequestDispatcher.ERROR_EXCEPTION, new RuntimeException("boom"))
++                        .requestAttr(RequestDispatcher.ERROR_EXCEPTION_TYPE, RuntimeException.class))
++                .andExpect(status().isInternalServerError())
++                .andExpect(content().string(SafeErrorController.SAFE_MESSAGE));
++    }
++
++    @Test
++    void preserves404WhenNotFound() throws Exception {
++        mockMvc.perform(get("/error")
++                        .requestAttr(RequestDispatcher.ERROR_STATUS_CODE, Integer.valueOf(404)))
++                .andExpect(status().isNotFound())
++                .andExpect(content().string(SafeErrorController.SAFE_MESSAGE));
++    }
++}
+diff --git a/src/test/java/com/example/InternetStore/utils/error/SafeErrorHandlerTest.java b/src/test/java/com/example/InternetStore/utils/error/SafeErrorHandlerTest.java
+new file mode 100644
+index 0000000..a9308f5
+--- /dev/null
++++ b/src/test/java/com/example/InternetStore/utils/error/SafeErrorHandlerTest.java
+@@ -0,0 +1,31 @@
++package com.example.InternetStore.utils.error;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++import java.nio.charset.StandardCharsets;
++
++import org.junit.jupiter.api.Test;
++import org.springframework.mock.web.MockHttpServletResponse;
++
++class SafeErrorHandlerTest {
++
++    @Test
++    void returnsSafe500WithoutStackTrace() throws Exception {
++        SafeErrorHandler handler = new SafeErrorHandler();
++        MockHttpServletResponse response = new MockHttpServletResponse();
++
++        RuntimeException boom = new RuntimeException("secret internal detail");
++        handler.handleException(boom, response);
++
++        assertEquals(500, response.getStatus());
++        String body = response.getContentAsString(StandardCharsets.UTF_8);
++        assertEquals(ErrorHtmlRenderer.renderErrorPage(), body);
++        assertTrue(body.contains(SafeErrorHandler.FALLBACK_MESSAGE));
++        assertFalse(body.contains("secret internal detail"));
++        assertFalse(body.contains("RuntimeException"));
++        assertFalse(body.toLowerCase().contains("exception"));
++        assertTrue(response.getContentType() != null);
++    }
++}

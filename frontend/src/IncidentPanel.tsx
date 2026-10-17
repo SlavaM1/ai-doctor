@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { mutate, useApi } from './api'
-import { canDeploy, testsPassed } from './deployment'
+import { canContinueFix, canDeploy, testsPassed } from './deployment'
 import { Badge, ConfirmDialog, DataValue, date, Empty, ErrorNotice, Icon, ModelSelect, number, statusTone, text } from './components'
 import { label } from './labels'
 import type { Diagnosis, FixJob, IncidentDetail, JsonObject, Model, Settings } from './types'
@@ -51,7 +51,7 @@ function TestResults({ tests }: { tests: JsonObject }) {
 
 function FixBudget({ job, refresh, onError }: { job: FixJob; refresh: () => void; onError: (error: string) => void }) {
   const [busy, setBusy] = useState(false)
-  const canContinue = ['FAILED', 'BUDGET_EXHAUSTED', 'INTERRUPTED'].includes(job.status) && (job.remaining_calls ?? 0) > 0
+  const canContinue = canContinueFix(job)
   const resume = async () => {
     setBusy(true)
     try { await mutate(`/fixes/${job.id}/continue`, {}); refresh() }
@@ -60,12 +60,14 @@ function FixBudget({ job, refresh, onError }: { job: FixJob; refresh: () => void
   }
   return <div className="test-results">
     {job.usage && <p className="small muted">Использовано вызовов: {number(job.calls_used)}; осталось: {number(job.remaining_calls)}. Токенов на входе: {number(job.usage.input_tokens)} / на выходе: {number(job.usage.output_tokens)}{job.usage.approximate ? ' (приблизительно)' : ''}. {number(job.usage.latency_ms)} мс.</p>}
+    {job.tool_calls_used != null && <p className="small muted">Вызовов инструментов: {number(job.tool_calls_used)}; осталось: {number(job.remaining_tool_calls)}.{job.remaining_tool_calls === 0 ? ' Лимит инструментов исчерпан; продолжение этой задачи недоступно.' : ''}</p>}
     {canContinue && <button className="button" disabled={busy} onClick={resume}>{busy ? 'Отправка запроса…' : 'Продолжить в пределах лимита'}</button>}
     {canContinue && <p className="small muted">Продолжение сохраняет рабочую область и счётчик вызовов. {job.auto_deploy ? 'Ранее разрешённый автодеплой остаётся включён.' : 'Автодеплой не разрешён.'}</p>}
+    {job.new_workspace_required && <p className="small muted">Рабочая область устарела или конфликтует с текущим релизом. Введите цель и нажмите «Подготовить исправление»: будет создана новая рабочая область, прежние правки сохранятся в истории.</p>}
   </div>
 }
 
-function FixReview({ job, refresh, onError, stale }: { job: FixJob; refresh: () => void; onError: (error: string) => void; stale: boolean }) {
+export function FixReview({ job, refresh, onError, stale }: { job: FixJob; refresh: () => void; onError: (error: string) => void; stale: boolean }) {
   const [approval, setApproval] = useState<{ id: number; sha: string } | null>(null)
   const [acknowledged, setAcknowledged] = useState(false)
   const [deploying, setDeploying] = useState(false)
@@ -97,6 +99,7 @@ function FixReview({ job, refresh, onError, stale }: { job: FixJob; refresh: () 
     {job.auto_deploy && <p className="small muted">Разрешён автоматический цикл: исправление → тесты → развёртывание. При неудаче — откат; продолжение только в пределах лимита.</p>}
     {job.summary && <p className="prose">{job.summary}</p>}
     {job.error && <ErrorNotice>{job.error}</ErrorNotice>}
+    {job.deployment && <details className="result-details" open={job.status === 'FAILED'}><summary>Развёртывание #{job.deployment.id}: {label(job.deployment.status)}</summary><DataValue value={job.deployment.result} /></details>}
     <FixBudget job={job} refresh={refresh} onError={onError} />
     <dl className="compact-facts"><div><dt>Модель</dt><dd>{job.model || 'Нет данных'}</dd></div>{job.base_commit && <div><dt>Базовый коммит</dt><dd className="mono wrap">{job.base_commit}</dd></div>}</dl>
     {job.changed_files?.length > 0 && <details className="result-details"><summary>Изменённые файлы ({job.changed_files.length})</summary><DataValue value={job.changed_files} /></details>}
@@ -142,7 +145,7 @@ export default function IncidentPanel({ id, revision, refresh, models, settings 
   const fix = useApi<FixJob>(fixId != null ? `/fixes/${fixId}` : null, revision)
   const currentFix = fix.data || fixes.find(job => job.id === fixId)
 
-  const resumable = currentFix && currentFix.id === fixes[0]?.id && ['FAILED', 'BUDGET_EXHAUSTED', 'INTERRUPTED'].includes(currentFix.status) && (currentFix.remaining_calls ?? 0) > 0
+  const resumable = currentFix && currentFix.id === fixes[0]?.id && canContinueFix(currentFix)
   const action = async (kind: 'analyze' | 'explain' | 'fix', confirmed = false) => {
     if (busy || (kind !== 'analyze' && !goal.trim())) return
     if (kind === 'fix' && autoDeploy && !confirmed) { setConfirmAuto(true); return }
