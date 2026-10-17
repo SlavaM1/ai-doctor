@@ -81,7 +81,7 @@ export interface Deployment {
 export interface Status {
   target: { running?: boolean; healthy?: boolean; container_id?: string; health?: unknown; status?: string; [key: string]: unknown }
   collector: JsonObject
-  stats: { active_incidents?: number; errors_hour?: number; errors_day?: number; completed_fixes?: number }
+  stats: { active_incidents?: number; errors_hour?: number; errors_day?: number; completed_fixes?: number; excluded_incidents?: number; excluded_occurrences?: number; excluded_errors_hour?: number; excluded_errors_day?: number }
   usage: { input_tokens?: number; output_tokens?: number; total_tokens?: number; calls?: number; latency_ms?: number }
   [key: string]: unknown
 }

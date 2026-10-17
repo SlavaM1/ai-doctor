@@ -213,6 +213,12 @@ async def status():
                  'errors_hour': session.scalar(select(func.count()).select_from(Occurrence).where(Occurrence.seen_at >= (current - timedelta(hours=1)).isoformat())),
                  'errors_day': session.scalar(select(func.count()).select_from(Occurrence).where(Occurrence.seen_at >= (current - timedelta(days=1)).isoformat())),
                  'completed_fixes': session.scalar(select(func.count()).select_from(FixJob).where(FixJob.status == 'DEPLOYED'))}
+        ignored = Incident.status.in_(['NO_ACTION', 'EXCLUDED'])
+        stats['excluded_incidents'] = session.scalar(select(func.count()).select_from(Incident).where(ignored))
+        # Lifetime counters survive occurrence retention; time windows use retained rows.
+        stats['excluded_occurrences'] = session.scalar(select(func.coalesce(func.sum(Incident.occurrences), 0)).where(ignored))
+        for window, delta in [('hour', timedelta(hours=1)), ('day', timedelta(days=1))]:
+            stats[f'excluded_errors_{window}'] = session.scalar(select(func.count()).select_from(Occurrence).join(Incident).where(ignored, Occurrence.seen_at >= (current - delta).isoformat()))
         usage = {key: session.scalar(select(func.coalesce(func.sum(getattr(AgentRun, key)), 0))) for key in ('input_tokens', 'output_tokens', 'total_tokens', 'calls', 'latency_ms')}
         collection = dict(collector.value) if collector else {'status': 'not connected'}
         if collection.get('last_seen'):
@@ -225,7 +231,7 @@ async def status():
 @app.get('/incidents')
 def incidents(status: str = '', severity: str = '', excluded: bool = False):
     query = select(Incident).order_by(Incident.last_seen.desc()).limit(300)
-    query = query.where(Incident.status == 'EXCLUDED' if excluded else Incident.status != 'EXCLUDED')
+    query = query.where(Incident.status.in_(['NO_ACTION', 'EXCLUDED']) if excluded else Incident.status != 'EXCLUDED')
     if status:
         query = query.where(Incident.status == status)
     if severity:
@@ -594,8 +600,8 @@ async def chat(incident_id: int, body: ChatRequest):
     async with chat_lock:
         with Session() as session:
             incident = require_incident(session, incident_id)
-            if incident.status == 'EXCLUDED':
-                raise HTTPException(409, 'Сначала верните тип ошибки из исключений')
+            if incident.status in {'NO_ACTION', 'EXCLUDED'}:
+                raise HTTPException(409, 'Сначала измените статус инцидента или верните тип ошибки из исключений')
             diagnosis = session.scalar(select(Diagnosis).where(Diagnosis.incident_id == incident_id).order_by(Diagnosis.id.desc()))
             event = incident.event
             context = {'incident': {key: event.get(key) for key in ('exception_type', 'message', 'root_cause', 'service', 'version')},

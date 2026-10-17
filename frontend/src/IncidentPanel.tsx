@@ -166,19 +166,19 @@ export default function IncidentPanel({ id, revision, refresh, models, settings 
   const sortedDiagnoses = [...diagnoses].sort((a, b) => b.id - a.id)
   const latestDiagnosis = sortedDiagnoses[0]
   const event = incident.event || {}
-  const excluded = incident.status === 'EXCLUDED'
+  const excluded = ['EXCLUDED', 'NO_ACTION'].includes(incident.status)
   const trace = event.stack_trace ?? event.stacktrace ?? event.traceback ?? event.stack
   const timeline = [
     { at: incident.first_seen, title: 'Первое обнаружение', detail: `${incident.service}${incident.version ? ` / ${incident.version}` : ''}` },
     ...diagnoses.map(entry => ({ at: entry.created_at, title: entry.error ? 'Сбой диагностики' : 'Диагностика записана', detail: entry.model })),
     ...fixes.map(entry => ({ at: entry.created_at, title: `Создано исправление #${entry.id}`, detail: label(entry.status) })),
-    ...(incident.last_seen !== incident.first_seen ? [{ at: incident.last_seen, title: 'Последнее повторение', detail: `Всего повторений: ${number(incident.occurrences)}` }] : []),
+    ...(incident.last_seen !== incident.first_seen ? [{ at: incident.last_seen, title: 'Последнее повторение', detail: `Всего возникновений: ${number(incident.occurrences)}` }] : []),
   ].sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime())
 
   return <article className="incident-detail" aria-label={`Инцидент ${id}`}>
     <IncidentControls key={`${id}-${incident.status}`} id={id} status={incident.status} refresh={refresh} />
     {detail.error && <ErrorNotice>Не удалось обновить данные; показан последний загруженный инцидент. {detail.error}</ErrorNotice>}
-    <header className="incident-heading"><div className="incident-kicker"><span className="mono">INC-{incident.id}</span><Badge tone={statusTone(incident.severity)}>{label(incident.severity)}</Badge><Badge tone={statusTone(incident.status)}>{label(incident.status)}</Badge></div><h2>{incident.exception_type || 'Инцидент приложения'}</h2><p>{incident.message || 'Сообщение об инциденте отсутствует.'}</p><div className="incident-meta"><span><Icon name="source" size={14} />{incident.service || 'Сервис не указан'}</span>{incident.version && <span className="mono">{incident.version}</span>}<span><Icon name="clock" size={14} />{date(incident.last_seen)}</span><span>Повторений: {number(incident.occurrences)}</span></div></header>
+    <header className="incident-heading"><div className="incident-kicker"><span className="mono">INC-{incident.id}</span><Badge tone={statusTone(incident.severity)}>{label(incident.severity)}</Badge><Badge tone={statusTone(incident.status)}>{label(incident.status)}</Badge></div><h2>{incident.exception_type || 'Инцидент приложения'}</h2><p>{incident.message || 'Сообщение об инциденте отсутствует.'}</p><div className="incident-meta"><span><Icon name="source" size={14} />{incident.service || 'Сервис не указан'}</span>{incident.version && <span className="mono">{incident.version}</span>}<span><Icon name="clock" size={14} />{date(incident.last_seen)}</span><span title="Первое событие и все повторы">Возникновений: {number(incident.occurrences)}</span></div></header>
 
     <section className="work-section evidence-section"><div className="section-heading"><h3><Icon name="source" />Данные и исходный код</h3></div>
       <div className="intent-switch evidence-tabs" role="group" aria-label="Просмотр данных"><button type="button" aria-pressed={evidenceTab === 'source'} className={evidenceTab === 'source' ? 'selected' : ''} onClick={() => setEvidenceTab('source')}>Ошибка и исходный код</button><button type="button" aria-pressed={evidenceTab === 'log'} className={evidenceTab === 'log' ? 'selected' : ''} onClick={() => setEvidenceTab('log')}>Лог сессии</button></div>
@@ -190,7 +190,7 @@ export default function IncidentPanel({ id, revision, refresh, models, settings 
     </section>
 
     <section className="work-section"><div className="section-heading"><h3><Icon name="pulse" />Диагностика</h3><Badge tone={statusTone(incident.diagnosis_status)}>{label(incident.diagnosis_status)}</Badge></div>
-      {excluded && <p className="inline-empty">Диагностика отключена. Чтобы продолжить работу, нажмите «Вернуть в инциденты».</p>}
+      {excluded && <p className="inline-empty">Диагностика отключена. {incident.status === 'EXCLUDED' ? 'Чтобы продолжить работу, нажмите «Вернуть в инциденты».' : 'Чтобы продолжить работу, измените статус инцидента.'}</p>}
       <div className="analysis-controls"><ModelSelect value={diagnosisModel} onChange={setDiagnosisModel} models={models} configured={settings?.default_diagnosis_model} /><button className="button" disabled={!!busy || excluded} onClick={() => action('analyze')}><Icon name="pulse" size={16} />{busy === 'analyze' ? 'Отправка запроса…' : latestDiagnosis ? 'Повторить анализ' : 'Анализировать инцидент'}</button></div>
       {lastAction === 'analyze' && error && <ErrorNotice>{error}</ErrorNotice>}{lastAction === 'analyze' && feedback && <p className="feedback" role="status">{feedback}</p>}
       {latestDiagnosis ? <DiagnosisResult diagnosis={latestDiagnosis} /> : excluded ? <p className="inline-empty">Новые повторения сохраняются без анализа.</p> : incident.root_cause ? <div className="root-cause"><span className="field-label">Зафиксированная первопричина</span><p>{incident.root_cause}</p></div> : <p className="inline-empty">Диагностика ещё не выполнена. Выберите модель или используйте модель по умолчанию для анализа собранных данных.</p>}

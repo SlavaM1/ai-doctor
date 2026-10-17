@@ -184,6 +184,51 @@ def test_no_action_never_reopens_or_schedules_diagnosis(store):
     assert m.release_cooldowns() == []
 
 
+@pytest.mark.parametrize('status', ['NO_ACTION', 'EXCLUDED'])
+def test_ignored_warn_repeats_below_threshold_are_stored_once(store, status):
+    from doctor.db import ExclusionRule
+    from doctor.exclusions import signature
+    event = {**java_event(source='ignored-warn'), 'severity': 'WARN', 'stack_trace': 'WARN Connection failed'}
+    with store.begin() as session:
+        # Initially admitted by the ordinary WARN threshold.
+        assert m.store_event(session, event) == (None, False)
+        assert m.store_event(session, event) == (None, False)
+        incident_id, created = m.store_event(session, event)
+        assert created
+        incident = session.get(Incident, incident_id)
+        incident.status, incident.diagnosis_status = status, 'SKIPPED'
+        incident.last_seen = '2000-01-01T00:00:00+00:00'
+        session.delete(session.get(State, 'warn:' + m.fingerprint(event)))
+        if status == 'EXCLUDED':
+            session.add(ExclusionRule(signature=signature(event), sample=event))
+    with store.begin() as session:
+        repeat = {**event, 'source_id': 'warn-repeat'}
+        assert m.store_event(session, repeat) == (incident_id, False)
+        assert m.store_event(session, repeat) == (None, False)
+        incident = session.get(Incident, incident_id)
+        assert incident.status == status and incident.diagnosis_status == 'SKIPPED'
+        assert incident.occurrences == 2 and incident.last_seen != '2000-01-01T00:00:00+00:00'
+        assert session.query(Occurrence).filter_by(incident_id=incident_id).count() == 2
+        upgraded, queued = m.store_event(session, {**event, 'source_id': 'upgrade', 'version': 'new-version'})
+        if status == 'EXCLUDED':
+            assert upgraded != incident_id and not queued
+            assert session.get(Incident, upgraded).status == 'EXCLUDED'
+            assert session.get(Incident, upgraded).diagnosis_status == 'SKIPPED'
+        else:
+            # NO_ACTION is scoped to the existing versioned fingerprint, not a family rule.
+            assert upgraded is None and not queued
+
+
+def test_no_action_does_not_suppress_new_version(store):
+    with store.begin() as session:
+        incident_id, _ = m.store_event(session, java_event())
+        incident = session.get(Incident, incident_id)
+        incident.status, incident.diagnosis_status = 'NO_ACTION', 'SKIPPED'
+        upgraded, queued = m.store_event(session, {**java_event(source='upgrade'), 'version': 'new-version'})
+        assert upgraded != incident_id and queued
+        assert session.get(Incident, upgraded).diagnosis_status == 'PENDING'
+
+
 def test_session_log_five_neighbors_grouping_multiline_and_later_batches(store):
     from doctor.db import IncidentLogWindow, SessionLogEvent
     def entry(index, level='INFO', trace='session-a', text='event'):

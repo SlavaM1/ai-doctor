@@ -128,8 +128,6 @@ def significant(event: dict, session) -> bool:
 
 
 def store_event(session, event: dict) -> tuple[int | None, bool]:
-    if not significant(event, session):
-        return None, False
     if session.scalar(select(Occurrence.id).where(Occurrence.source_id == event['source_id'])):
         return None, False
     fp = fingerprint(event)
@@ -144,6 +142,10 @@ def store_event(session, event: dict) -> tuple[int | None, bool]:
         incident = variant
     elif incident and signature(incident.event) != key and (excluded or incident.status == 'EXCLUDED'):
         incident, fp = None, strict_fp
+    # Detection thresholds admit new problems, not repeats of ignored ones.
+    # Keep every excluded WARN, including below threshold after a quiet period.
+    if not (excluded or (incident and incident.status in {'NO_ACTION', 'EXCLUDED'})) and not significant(event, session):
+        return None, False
     created = incident is None
     if created:
         incident = Incident(id=next_id(session, Incident), fingerprint=fp, severity=event['severity'], exception_type=event['exception_type'],
@@ -172,7 +174,7 @@ def store_event(session, event: dict) -> tuple[int | None, bool]:
     session.add(Occurrence(incident_id=incident.id, source_id=event['source_id']))
     from .session_logs import snapshot
     snapshot(session, incident.id, event)
-    return incident.id, created
+    return incident.id, created and incident.status not in {'NO_ACTION', 'EXCLUDED'}
 
 
 def ingest_batch(payload: dict) -> dict:

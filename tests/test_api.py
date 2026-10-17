@@ -475,3 +475,59 @@ def test_excluding_family_is_atomic_when_one_member_has_active_work(controls):
     with factory() as session:
         assert session.query(ExclusionRule).count() == 0
         assert session.get(Incident, 1).status == 'NEW'
+
+
+def test_exclusion_list_and_statistics_include_no_action_and_all_occurrences(controls, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    from doctor.db import Occurrence
+    client, factory, _ = controls
+    async def runner_status(*args, **kwargs):
+        return {'running': True, 'healthy': True}
+    monkeypatch.setattr(main, 'runner_call', runner_status)
+    current = datetime.now(timezone.utc)
+    with factory.begin() as session:
+        session.get(Incident, 1).status = 'NO_ACTION'
+        session.get(Incident, 1).occurrences = 10  # Includes already-pruned history.
+        session.add(Incident(id=2, fingerprint='excluded', status='EXCLUDED', occurrences=4))
+        session.add(Incident(id=3, fingerprint='active'))
+        session.flush()
+        for index, (incident_id, hours) in enumerate([(1, 0), (1, 2), (2, 0), (2, 25), (3, 0)]):
+            session.add(Occurrence(incident_id=incident_id, source_id=f'counter-{index}', seen_at=(current - timedelta(hours=hours)).isoformat()))
+    assert {row['id'] for row in client.get('/incidents?excluded=true').json()} == {1, 2}
+    assert [row['id'] for row in client.get('/incidents?excluded=true&status=NO_ACTION').json()] == [1]
+    assert [row['id'] for row in client.get('/incidents?excluded=true&status=EXCLUDED').json()] == [2]
+    assert [row['id'] for row in client.get('/incidents?status=NO_ACTION').json()] == [1]
+    stats = client.get('/status').json()['stats']
+    assert stats['active_incidents'] == 1
+    assert stats['excluded_incidents'] == 2 and stats['excluded_occurrences'] == 14
+    assert stats['excluded_errors_hour'] == 2 and stats['excluded_errors_day'] == 3
+    assert stats['errors_hour'] == 3 and stats['errors_day'] == 4
+
+
+def test_exclusion_statistics_empty_and_not_limited_to_visible_list(controls, monkeypatch):
+    client, factory, _ = controls
+    async def runner_status(*args, **kwargs):
+        return {}
+    monkeypatch.setattr(main, 'runner_call', runner_status)
+    stats = client.get('/status').json()['stats']
+    assert all(stats[key] == 0 for key in ('excluded_incidents', 'excluded_occurrences', 'excluded_errors_hour', 'excluded_errors_day'))
+    with factory.begin() as session:
+        session.add_all(Incident(fingerprint=f'excluded-{index}', status='EXCLUDED', occurrences=2) for index in range(305))
+    assert len(client.get('/incidents?excluded=true').json()) == 300
+    stats = client.get('/status').json()['stats']
+    assert stats['excluded_incidents'] == 305 and stats['excluded_occurrences'] == 610
+
+
+@pytest.mark.parametrize('status', ['NO_ACTION', 'EXCLUDED'])
+def test_ignored_incidents_cannot_call_models_via_chat(controls, monkeypatch, status):
+    from doctor import ai
+    client, factory, headers = controls
+    async def forbidden(*args, **kwargs):
+        raise AssertionError('Ignored incidents must not reach models')
+    monkeypatch.setattr(ai, 'select_model', forbidden)
+    monkeypatch.setattr(ai, 'llm_call', forbidden)
+    with factory.begin() as session:
+        session.get(Incident, 1).status = status
+    assert client.post('/incidents/1/chat', headers=headers, json={'message': 'explain'}).status_code == 409
+    with factory() as session:
+        assert session.query(AgentRun).count() == 0
