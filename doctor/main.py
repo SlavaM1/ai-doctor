@@ -1,7 +1,8 @@
 import asyncio
 import hmac
 import json
-from contextlib import asynccontextmanager
+import uuid
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Literal
 from fastapi import FastAPI, Request, HTTPException
@@ -89,6 +90,9 @@ async def lifespan(app):
             row.status, row.error = 'INTERRUPTED', 'API restarted; workspace preserved. Prepare a new fix to continue.'
         for row in session.scalars(select(Deployment).where(Deployment.status.in_(['RUNNING', 'DEPLOYING']))):
             row.status = 'INTERRUPTED'
+        for row in session.scalars(select(State).where(State.key.like('manual-git:%'))):
+            if row.value.get('status') == 'RUNNING':
+                row.value = {**row.value, 'status': 'UNKNOWN'}
     tasks = [asyncio.create_task(fn()) for fn in (diagnosis_worker, fix_worker, parser_worker, retention_worker)]
     try:
         yield
@@ -180,13 +184,24 @@ def require_incident(session, incident_id):
     return incident
 
 
+@contextmanager
+def incident_control_session():
+    # Serialize admission and destructive controls across API processes/restarts,
+    # not just asyncio tasks. Read-then-write SQLite transactions are insufficient.
+    with Session.begin() as session:
+        session.connection().exec_driver_sql('BEGIN IMMEDIATE')
+        yield session
+
+
 def require_idle(session, incident):
     jobs = select(FixJob.id).where(FixJob.incident_id == incident.id)
+    git_operation = session.get(State, f'manual-git:{incident.id}')
     if (incident.diagnosis_status == 'ANALYZING'
             or session.scalar(jobs.where(FixJob.status.in_(['RUNNING', 'PREPARING', 'TESTING'])))
-            or session.scalar(select(Deployment.id).where(Deployment.fix_job_id.in_(jobs), Deployment.status.in_(['RUNNING', 'DEPLOYING', 'UNKNOWN', 'ROLLBACK_FAILED'])))
+            or session.scalar(select(Deployment.id).where(Deployment.fix_job_id.in_(jobs), Deployment.status.in_(['RUNNING', 'DEPLOYING', 'UNKNOWN', 'INTERRUPTED', 'ROLLBACK_FAILED'])))
+            or (git_operation and git_operation.value.get('status') in {'RUNNING', 'UNKNOWN'})
             or chat_lock.locked() or manual_git_lock.locked()):
-        raise HTTPException(409, 'Дождитесь завершения активной работы; неизвестное состояние развёртывания требует проверки на хосте')
+        raise HTTPException(409, 'Дождитесь завершения активной работы; неизвестное или прерванное состояние развёртывания/Git требует достоверной проверки на хосте')
 
 
 def cancel_queued(session, incident):
@@ -203,7 +218,7 @@ class IncidentStatusRequest(BaseModel):
 
 @app.patch('/incidents/{incident_id}/status')
 async def change_incident_status(incident_id: int, body: IncidentStatusRequest):
-    with Session.begin() as session:
+    with incident_control_session() as session:
         incident = require_incident(session, incident_id)
         require_idle(session, incident)
         incident.status = body.status
@@ -226,7 +241,7 @@ class ConfirmationRequest(BaseModel):
 async def delete_incident(incident_id: int, body: ConfirmationRequest):
     if not body.confirmed:
         raise HTTPException(403, 'Подтвердите удаление инцидента и его истории')
-    with Session.begin() as session:
+    with incident_control_session() as session:
         incident = require_incident(session, incident_id)
         require_idle(session, incident)
         jobs = select(FixJob.id).where(FixJob.incident_id == incident_id)
@@ -235,7 +250,7 @@ async def delete_incident(incident_id: int, body: ConfirmationRequest):
         session.execute(delete(Deployment).where(Deployment.fix_job_id.in_(jobs)))
         for model in (IncidentLogWindow, Occurrence, Diagnosis, AgentRun, FixJob):
             session.execute(delete(model).where(model.incident_id == incident_id))
-        for key in ('chat', 'diagnosis-model', 'cooldown'):
+        for key in ('chat', 'diagnosis-model', 'cooldown', 'manual-git'):
             row = session.get(State, f'{key}:{incident_id}')
             if row:
                 session.delete(row)
@@ -389,7 +404,8 @@ async def manual_git(job_id: int, body: ManualGitRequest):
     if manual_git_lock.locked():
         raise HTTPException(409, 'Действие Git уже выполняется')
     async with manual_git_lock:
-        with Session() as session:
+        operation_id = uuid.uuid4().hex
+        with incident_control_session() as session:
             job = session.get(FixJob, job_id)
             if not job:
                 raise HTTPException(404, 'Исправление не найдено')
@@ -397,13 +413,32 @@ async def manual_git(job_id: int, body: ManualGitRequest):
                 raise HTTPException(409, 'Сначала измените статус «Не требует решения»')
             if job.status not in {'READY', 'DEPLOYED'} or not job.patch_sha or not hmac.compare_digest(body.patch_sha, job.patch_sha):
                 raise HTTPException(409, 'Исправление не готово или его хеш изменился')
-            workspace = job.workspace
+            workspace, incident_id = job.workspace, job.incident_id
+            key = f'manual-git:{incident_id}'
+            previous = session.get(State, key)
+            if previous and previous.value.get('status') in {'RUNNING', 'UNKNOWN'}:
+                raise HTTPException(409, 'Предыдущее действие Git ещё выполняется или его завершение не подтверждено на хосте')
+            # Commit BEFORE dispatch: a disconnected API cannot revoke accepted
+            # host work, including work still waiting for Runner.locked().
+            session.merge(State(key=key, value={'status': 'RUNNING', 'operation_id': operation_id,
+                                               'job_id': job_id, 'action': body.action, 'started_at': now()}))
         try:
             result = await runner_call('manual-git', {**body.model_dump(), 'workspace_id': workspace}, timeout=90)
-        except Exception as exc:
-            raise HTTPException(409, 'Git не выполнен. Проверьте ветку, identity и доступ GitHub на хосте; секреты не передаются в API.') from exc
+        except (Exception, asyncio.CancelledError) as exc:
+            finish_manual_git(key, operation_id, 'UNKNOWN')
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            raise HTTPException(409, 'Завершение Git не подтверждено. Операция могла продолжиться на хосте; удаление и смена статуса заблокированы до достоверной проверки.') from exc
+        finish_manual_git(key, operation_id, 'SUCCEEDED')
         await bus.publish('fix', {'job_id': job_id})
         return result
+
+
+def finish_manual_git(key, operation_id, status):
+    with incident_control_session() as session:
+        operation = session.get(State, key)
+        if operation and operation.value.get('operation_id') == operation_id:
+            operation.value = {**operation.value, 'status': status, 'updated_at': now()}
 
 
 @app.post('/fixes/{job_id}/deploy')

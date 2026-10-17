@@ -5,6 +5,8 @@ from sqlalchemy.pool import StaticPool
 from doctor import main
 from doctor.db import Base, Incident, FixJob, AgentRun
 import pytest
+import asyncio
+import httpx
 
 
 @pytest.fixture
@@ -46,7 +48,7 @@ def test_delete_confirmation_links_pending_work_and_id_nonreuse(controls):
     assert client.get('/incidents/1').status_code == 404
 
 
-@pytest.mark.parametrize('active', ['diagnosis', 'fix', 'deployment', 'unknown-deployment'])
+@pytest.mark.parametrize('active', ['diagnosis', 'fix', 'deployment', 'unknown-deployment', 'interrupted-deployment'])
 def test_delete_and_status_changes_refuse_active_work(controls, active):
     from doctor.db import Deployment
     client, factory, headers = controls
@@ -57,7 +59,8 @@ def test_delete_and_status_changes_refuse_active_work(controls, active):
             session.add(FixJob(id=1, incident_id=1, status='RUNNING' if active == 'fix' else 'READY'))
             session.flush()
             if 'deployment' in active:
-                session.add(Deployment(fix_job_id=1, status='UNKNOWN' if active.startswith('unknown') else 'DEPLOYING'))
+                status = 'UNKNOWN' if active.startswith('unknown') else 'INTERRUPTED' if active.startswith('interrupted') else 'DEPLOYING'
+                session.add(Deployment(fix_job_id=1, status=status))
     assert client.request('DELETE', '/incidents/1', headers=headers, json={'confirmed': True}).status_code == 409
     assert client.patch('/incidents/1/status', headers=headers, json={'status': 'NO_ACTION'}).status_code == 409
     with factory() as session:
@@ -86,9 +89,12 @@ def test_manual_status_no_action_cancels_queues_and_prevents_actions(controls):
 
 
 def test_manual_git_api_is_explicit_and_forwards_only_prepared_workspace(controls, monkeypatch):
+    from doctor.db import State
     client, factory, headers = controls
     calls = []
     async def runner(operation, payload, timeout):
+        with factory() as session:
+            assert session.get(State, 'manual-git:1').value['status'] == 'RUNNING'
         calls.append((operation, payload))
         return {'branch': payload['branch']}
     monkeypatch.setattr(main, 'runner_call', runner)
@@ -101,6 +107,142 @@ def test_manual_git_api_is_explicit_and_forwards_only_prepared_workspace(control
     assert not calls
     assert client.post('/fixes/1/git', headers=headers, json=body).status_code == 200
     assert calls[0][0] == 'manual-git' and calls[0][1]['workspace_id'] == 'job-1'
+    for action in ('commit', 'push'):
+        assert client.post('/fixes/1/git', headers=headers, json={**body, 'action': action, 'message': 'fix'}).status_code == 200
+    with factory() as session:
+        assert session.get(State, 'manual-git:1').value['status'] == 'SUCCEEDED'
+    assert client.patch('/incidents/1/status', headers=headers, json={'status': 'NO_ACTION'}).status_code == 200
+    assert client.request('DELETE', '/incidents/1', headers=headers, json={'confirmed': True}).status_code == 200
+    with factory() as session:
+        assert session.get(State, 'manual-git:1') is None
+
+
+def stub_control_restart(monkeypatch):
+    async def idle_worker():
+        await asyncio.Event().wait()
+    monkeypatch.setattr(main, 'init_db', lambda: None)
+    for name in ('diagnosis_worker', 'fix_worker', 'parser_worker', 'retention_worker'):
+        monkeypatch.setattr(main, name, idle_worker)
+    # A real restart discards process-local locks, but not committed SQLite State.
+    monkeypatch.setattr(main, 'manual_git_lock', asyncio.Lock())
+
+
+def test_restart_interrupted_deploy_still_blocks_controls_and_preserves_history(controls, monkeypatch):
+    from doctor.db import Deployment
+    _, factory, headers = controls
+    with factory.begin() as session:
+        session.add(FixJob(id=1, incident_id=1, status='READY'))
+        session.flush()
+        session.add(Deployment(id=1, fix_job_id=1, status='DEPLOYING', result={'evidence': 'preserve'}))
+    stub_control_restart(monkeypatch)
+    with TestClient(main.app, base_url='http://127.0.0.1') as restarted:
+        assert restarted.request('DELETE', '/incidents/1', headers=headers, json={'confirmed': True}).status_code == 409
+        for status in ('NO_ACTION', 'RESOLVED', 'OPEN'):
+            assert restarted.patch('/incidents/1/status', headers=headers, json={'status': status}).status_code == 409
+        history = restarted.get('/deployments').json()
+        assert history[0]['status'] == 'INTERRUPTED' and history[0]['result'] == {'evidence': 'preserve'}
+    with factory() as session:
+        assert session.get(Deployment, 1) and session.get(FixJob, 1) and session.get(Incident, 1)
+
+
+def test_git_timeout_and_restart_do_not_release_durable_guard(controls, monkeypatch):
+    from doctor.db import State
+    client, factory, headers = controls
+    with factory.begin() as session:
+        session.add(FixJob(id=1, incident_id=1, status='READY', patch_sha='a' * 64, workspace='job-1'))
+    calls = []
+    async def still_running(operation, payload, timeout):
+        # The host may be waiting on its lock or pushing after this timeout.
+        with factory() as session:
+            value = session.get(State, 'manual-git:1').value
+            assert value['status'] == 'RUNNING' and value['action'] == 'push'
+        calls.append(payload)
+        raise httpx.ReadTimeout('Sensitive provider detail must not be persisted')
+    monkeypatch.setattr(main, 'runner_call', still_running)
+    body = {'confirmed': True, 'patch_sha': 'a' * 64, 'action': 'push', 'branch': 'doctor/test'}
+    response = client.post('/fixes/1/git', headers=headers, json=body)
+    assert response.status_code == 409 and 'Sensitive' not in response.text
+    assert not main.manual_git_lock.locked()
+    with factory() as session:
+        value = session.get(State, 'manual-git:1').value
+        assert value['status'] == 'UNKNOWN' and 'Sensitive' not in repr(value)
+    stub_control_restart(monkeypatch)
+    with TestClient(main.app, base_url='http://127.0.0.1') as restarted:
+        assert restarted.request('DELETE', '/incidents/1', headers=headers, json={'confirmed': True}).status_code == 409
+        assert restarted.patch('/incidents/1/status', headers=headers, json={'status': 'NO_ACTION'}).status_code == 409
+        assert restarted.post('/fixes/1/git', headers=headers, json=body).status_code == 409
+        assert len(calls) == 1
+
+
+def test_restart_preserves_unacknowledged_running_git_admission(controls, monkeypatch):
+    from doctor.db import State
+    _, factory, headers = controls
+    with factory.begin() as session:
+        # Simulate process death after durable admission, before any response.
+        session.add(State(key='manual-git:1', value={'status': 'RUNNING', 'operation_id': 'old-request', 'action': 'push'}))
+    stub_control_restart(monkeypatch)
+    with TestClient(main.app, base_url='http://127.0.0.1') as restarted:
+        with factory() as session:
+            assert session.get(State, 'manual-git:1').value['status'] == 'UNKNOWN'
+        assert restarted.request('DELETE', '/incidents/1', headers=headers, json={'confirmed': True}).status_code == 409
+        assert restarted.patch('/incidents/1/status', headers=headers, json={'status': 'OPEN'}).status_code == 409
+    # An unrelated/late completion cannot clear a different operation's guard.
+    main.finish_manual_git('manual-git:1', 'different-request', 'SUCCEEDED')
+    with factory() as session:
+        assert session.get(State, 'manual-git:1').value['status'] == 'UNKNOWN'
+
+
+@pytest.mark.asyncio
+async def test_cancelled_git_request_keeps_unknown_guard_after_lock_released(controls, monkeypatch):
+    from doctor.db import State
+    from fastapi import HTTPException
+    _, factory, _ = controls
+    with factory.begin() as session:
+        session.add(FixJob(id=1, incident_id=1, status='READY', patch_sha='a' * 64, workspace='job-1'))
+    async def disconnected(*args, **kwargs):
+        raise asyncio.CancelledError()
+    monkeypatch.setattr(main, 'runner_call', disconnected)
+    with pytest.raises(asyncio.CancelledError):
+        await main.manual_git(1, main.ManualGitRequest(confirmed=True, patch_sha='a' * 64, action='push', branch='doctor/test'))
+    assert not main.manual_git_lock.locked()
+    with factory() as session:
+        assert session.get(State, 'manual-git:1').value['status'] == 'UNKNOWN'
+    with pytest.raises(HTTPException) as error:
+        await main.delete_incident(1, main.ConfirmationRequest(confirmed=True))
+    assert error.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_other_api_instance_cannot_remove_incident_while_host_git_waits(controls, monkeypatch):
+    from doctor.db import State
+    from fastapi import HTTPException
+    _, factory, _ = controls
+    with factory.begin() as session:
+        session.add(FixJob(id=1, incident_id=1, status='READY', patch_sha='a' * 64, workspace='job-1'))
+    accepted, release = asyncio.Event(), asyncio.Event()
+    async def waiting_host(*args, **kwargs):
+        accepted.set()
+        await release.wait()
+        return {'branch': 'doctor/test'}
+    monkeypatch.setattr(main, 'runner_call', waiting_host)
+    request = asyncio.create_task(main.manual_git(1, main.ManualGitRequest(
+        confirmed=True, patch_sha='a' * 64, action='branch', branch='doctor/test')))
+    try:
+        await accepted.wait()
+        # A second API instance/restart has a fresh process-local lock.
+        monkeypatch.setattr(main, 'manual_git_lock', asyncio.Lock())
+        with pytest.raises(HTTPException) as error:
+            await main.delete_incident(1, main.ConfirmationRequest(confirmed=True))
+        assert error.value.status_code == 409
+        with pytest.raises(HTTPException) as error:
+            await main.change_incident_status(1, main.IncidentStatusRequest(status='NO_ACTION'))
+        assert error.value.status_code == 409
+    finally:
+        release.set()
+        await request
+    with factory() as session:
+        assert session.get(State, 'manual-git:1').value['status'] == 'SUCCEEDED'
+    assert (await main.change_incident_status(1, main.IncidentStatusRequest(status='NO_ACTION')))['status'] == 'NO_ACTION'
 
 
 def test_session_log_api_preserves_original_error_when_no_context(controls):
